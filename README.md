@@ -40,7 +40,7 @@ The preprocessing stage validates recording coverage, seizure annotations, chann
 pip install -r requirements.txt
 ```
 
-The tested environment uses PyTorch 2.6.0 with CUDA 12.4 on an NVIDIA GeForce RTX 3060 Laptop GPU. Runtime hardware and package versions are recorded automatically in `paper_results/environment.json`.
+The validated training environment uses PyTorch 2.6.0+cu124 on an NVIDIA GeForce RTX 3060 Laptop GPU with 48 GB system RAM. GPU name, GPU memory, CUDA/PyTorch versions, package versions, and platform information are recorded automatically in the result artifacts.
 
 ## Final execution
 
