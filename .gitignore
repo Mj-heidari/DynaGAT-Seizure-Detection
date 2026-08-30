@@ -1,31 +1,22 @@
-# Raw dataset
 data/
-
-# Generated/cache data
 data_cache_v2/
 data_cache_v3/
 
-# Python cache
 __pycache__/
 *.py[cod]
 
-# Virtual environments
 .venv/
 venv/
 env/
 
-# Logs
 *.log
-
-# VS Code
 .vscode/
-
-# Windows
 Thumbs.db
 Desktop.ini
 
-# Generated model/evaluation artifacts
 results/*.pt
 results/*.npz
 results/*.csv
 paper_figures/
+paper_tables/
+paper_results/
