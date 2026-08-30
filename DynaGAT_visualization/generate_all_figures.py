@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from config import PROCESSED_DATA_DIR
 from .plot_calibration import plot_calibration
 from .plot_detection_timeline import plot_detection_timeline
 from .plot_event_tradeoff import plot_event_tradeoff
@@ -40,6 +41,15 @@ def _history_files_for_current_run(results: Path, summary: Path) -> list[Path]:
     return sorted(results.glob("fold_*_training_history.csv"))
 
 
+def _clear_previous_outputs(out: Path) -> None:
+    for pattern in ("*.png", "*.pdf", "figure_manifest.txt"):
+        for path in out.glob(pattern):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def generate_all_figures(
     results_dir: Path | None = None,
     out_dir: Path | None = None,
@@ -47,8 +57,9 @@ def generate_all_figures(
     results = Path(results_dir) if results_dir is not None else PROJECT_ROOT / "results"
     out = Path(out_dir) if out_dir is not None else PROJECT_ROOT / "paper_figures"
     out.mkdir(parents=True, exist_ok=True)
+    _clear_previous_outputs(out)
 
-    manifest = PROJECT_ROOT / "data_cache_v3" / "preprocessing_manifest.csv"
+    manifest = PROCESSED_DATA_DIR / "preprocessing_manifest.csv"
     if manifest.exists():
         plot_preprocessing_overview(manifest, out)
     else:
