@@ -5,7 +5,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 
 import numpy as np
 import pandas as pd
@@ -43,7 +43,7 @@ from evaluation.metrics import (
     compute_ece,
     compute_event_metrics,
     compute_window_metrics,
-    select_f1_threshold,
+    select_event_threshold,
 )
 from models.dynagat_model import DynaGATOnsetModel
 from training.losses import BoundaryAwareFocalLoss
@@ -93,9 +93,8 @@ def subject_groups(subjects: Sequence[str]) -> List[List[str]]:
 
 
 def make_loader(dataset: TemporalClipDataset, shuffle: bool, batch_size: int) -> DataLoader:
-    # num_workers=0 is deliberate here: v2 caches are mmap-backed and Windows
-    # worker spawning can duplicate mappings / RAM. Indexing precomputed tensors
-    # is very cheap, so the GPU is normally not starved.
+    # num_workers=0 is deliberate on Windows: mmap-backed caches plus worker
+    # spawning can duplicate mappings and RAM usage.
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -145,6 +144,7 @@ def train_epoch(
                 tensors["x"],
                 tensors["dynamic_dst"],
                 tensors["dynamic_weight"],
+                valid_mask=tensors["valid_mask"],
             )
             loss = criterion(
                 logits,
@@ -167,25 +167,60 @@ def train_epoch(
     return running_loss / max(1, batches)
 
 
+def _keep_largest_causal_context(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    recording_ids: List[str],
+    window_indices: np.ndarray,
+    context_positions: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, List[str], np.ndarray]:
+    """Resolve overlapped evaluation clips without averaging different contexts."""
+    if probs.size == 0:
+        return probs, labels, recording_ids, window_indices
+
+    rid = np.asarray(recording_ids, dtype=str)
+    # Primary key: recording id, secondary: absolute window index, tertiary:
+    # local context position. Keeping the last item therefore keeps the largest
+    # amount of available causal history for each physical EEG window.
+    order = np.lexsort((context_positions, window_indices, rid))
+    rid_s = rid[order]
+    idx_s = window_indices[order]
+    probs_s = probs[order]
+    labels_s = labels[order]
+
+    is_last = np.ones(len(order), dtype=bool)
+    if len(order) > 1:
+        is_last[:-1] = (rid_s[:-1] != rid_s[1:]) | (idx_s[:-1] != idx_s[1:])
+
+    return (
+        probs_s[is_last],
+        labels_s[is_last],
+        rid_s[is_last].tolist(),
+        idx_s[is_last],
+    )
+
+
 @torch.inference_mode()
 def predict(model: DynaGATOnsetModel, loader: DataLoader) -> PredictionBundle:
     model.eval()
     probs_parts: List[np.ndarray] = []
     label_parts: List[np.ndarray] = []
     index_parts: List[np.ndarray] = []
+    context_parts: List[np.ndarray] = []
     recording_ids: List[str] = []
 
     for batch in tqdm(loader, desc="evaluate", ncols=100, leave=False):
         x = batch["x"].to(DEVICE, non_blocking=True)
         dst = batch["dynamic_dst"].to(DEVICE, non_blocking=True)
         weight = batch["dynamic_weight"].to(DEVICE, non_blocking=True)
+        valid_gpu = batch["valid_mask"].to(DEVICE, non_blocking=True)
 
         with torch.amp.autocast(
             device_type="cuda",
             dtype=torch.float16,
             enabled=torch.cuda.is_available(),
         ):
-            logits = model(x, dst, weight)
+            logits = model(x, dst, weight, valid_mask=valid_gpu)
             probs = torch.sigmoid(logits).cpu()
 
         labels = batch["labels"]
@@ -194,24 +229,54 @@ def predict(model: DynaGATOnsetModel, loader: DataLoader) -> PredictionBundle:
 
         for b, rid in enumerate(batch["recording_id"]):
             valid = mask[b]
-            count = int(valid.sum())
+            valid_positions = torch.nonzero(valid, as_tuple=False).flatten()
+            count = int(valid_positions.numel())
             if count == 0:
                 continue
             probs_parts.append(probs[b][valid].numpy())
             label_parts.append(labels[b][valid].numpy())
             index_parts.append(window_idx[b][valid].numpy())
+            context_parts.append(valid_positions.numpy())
             recording_ids.extend([str(rid)] * count)
 
     probs_np = np.concatenate(probs_parts) if probs_parts else np.empty(0, dtype=np.float32)
     labels_np = np.concatenate(label_parts) if label_parts else np.empty(0, dtype=np.float32)
     indices_np = np.concatenate(index_parts) if index_parts else np.empty(0, dtype=np.int64)
+    contexts_np = np.concatenate(context_parts) if context_parts else np.empty(0, dtype=np.int64)
+
+    probs_np = np.nan_to_num(probs_np, nan=0.0, posinf=1.0, neginf=0.0)
+    probs_np, labels_np, recording_ids, indices_np = _keep_largest_causal_context(
+        probs_np,
+        labels_np,
+        recording_ids,
+        indices_np,
+        contexts_np,
+    )
 
     return PredictionBundle(
-        probs=np.nan_to_num(probs_np, nan=0.0, posinf=1.0, neginf=0.0),
+        probs=probs_np,
         labels=labels_np,
         recording_ids=recording_ids,
         window_indices=indices_np,
         recording_metadata=loader.dataset.recording_metadata,
+    )
+
+
+def save_prediction_bundle(
+    bundle: PredictionBundle,
+    path: Path,
+    threshold: float,
+    test_subjects: Sequence[str],
+) -> None:
+    """Persist real held-out predictions for reproducible figures and analysis."""
+    np.savez_compressed(
+        path,
+        probs=bundle.probs.astype(np.float32, copy=False),
+        labels=bundle.labels.astype(np.uint8, copy=False),
+        recording_ids=np.asarray(bundle.recording_ids, dtype=str),
+        window_indices=bundle.window_indices.astype(np.int64, copy=False),
+        threshold=np.asarray(float(threshold), dtype=np.float32),
+        test_patient=np.asarray("+".join(test_subjects), dtype=str),
     )
 
 
@@ -233,7 +298,7 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
     if not cache_paths:
         raise FileNotFoundError(
             f"No v2 temporal caches found in {PROCESSED_DATA_DIR}.\n"
-            "Run: python dataset/bids_loader.py"
+            "Run: python run_preprocessing.py"
         )
 
     print(f"[*] Loading {len(cache_paths)} mmap-backed patient caches...")
@@ -243,27 +308,26 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
         cache_by_subject[str(cache["subject"])] = cache
 
     groups = subject_groups(sorted(cache_by_subject))
+    if len(groups) < 3:
+        raise RuntimeError(
+            "LOPO requires at least 3 independent patient groups: train, validation, and test."
+        )
+
+    validation_size = min(4, len(groups) - 2)
     print(f"[*] LOPO patient groups: {len(groups)}")
-    print("[*] Test patient is never used for training, threshold selection, or checkpoint selection.")
-    print("[*] Four non-test patient groups are reserved as inner validation in each fold.\n")
+    print("[*] Test patient is never used for training, threshold selection, or normalization.")
+    print(f"[*] Inner validation groups per fold: {validation_size}\n")
 
     results: List[Dict] = []
-
     run_groups = groups[:max_folds] if max_folds is not None else groups
 
-    validation_size = 4
-
     for fold_idx, test_group in enumerate(run_groups):
-        # Use multiple unseen patients for inner validation instead of a single
-        # validation patient. This gives a more stable threshold estimate and
-        # reduces patient-specific threshold bias.
         validation_indices = [
             (fold_idx + offset) % len(groups)
             for offset in range(1, validation_size + 1)
         ]
-
-        train_indices = {fold_idx, *validation_indices}
-        train_groups = [g for i, g in enumerate(groups) if i not in train_indices]
+        excluded_indices = {fold_idx, *validation_indices}
+        train_groups = [g for i, g in enumerate(groups) if i not in excluded_indices]
         val_groups = [groups[i] for i in validation_indices]
 
         train_subjects = [s for group in train_groups for s in group]
@@ -308,7 +372,7 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
             model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs, eta_min=LEARNING_RATE * 0.1
+            optimizer, T_max=max(1, epochs), eta_min=LEARNING_RATE * 0.1
         )
         criterion = BoundaryAwareFocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA)
         scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
@@ -331,11 +395,24 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
                 f"time={epoch_sec:.1f}s | lr={scheduler.get_last_lr()[0]:.2e}{gpu_mem}"
             )
 
-        # Validation is intentionally performed only once after training. This is
-        # much faster than scanning a full held-out patient after every epoch.
+        # Validation is evaluated once after training. The held-out test patient is
+        # not touched until normalization, training, and threshold selection finish.
         val_pred = predict(model, val_loader)
-        threshold = select_f1_threshold(val_pred.labels, val_pred.probs)
+        threshold = select_event_threshold(
+            labels=val_pred.labels,
+            probs=val_pred.probs,
+            recording_ids=val_pred.recording_ids,
+            window_indices=val_pred.window_indices,
+            recording_metadata=val_pred.recording_metadata,
+        )
         val_window = compute_window_metrics(val_pred.labels, val_pred.probs, threshold)
+        val_event = compute_event_metrics(
+            probs=val_pred.probs,
+            recording_ids=val_pred.recording_ids,
+            window_indices=val_pred.window_indices,
+            recording_metadata=val_pred.recording_metadata,
+            threshold=threshold,
+        )
 
         test_pred = predict(model, test_loader)
         test_window = compute_window_metrics(test_pred.labels, test_pred.probs, threshold)
@@ -350,13 +427,18 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
 
         elapsed = time.perf_counter() - fold_start
         print(
+            f"VAL event-F1={val_event['event_f1']:.4f} | "
+            f"sens={val_event['event_sensitivity']:.4f} | "
+            f"FA/h={val_event['fa_per_hour']:.3f} | threshold={threshold:.4f}"
+        )
+        print(
             f"TEST {fold_name}: AUROC={test_window['auroc']:.4f} | "
-            f"AUPRC={test_window['auprc']:.4f} | F1={test_window['f1']:.4f} | "
-            f"threshold(val)={threshold:.4f}"
+            f"AUPRC={test_window['auprc']:.4f} | F1={test_window['f1']:.4f}"
         )
         print(
             f"Event sensitivity={event['event_sensitivity']:.4f} "
             f"({event['detected_seizures']}/{event['total_gt_seizures']}) | "
+            f"precision={event['event_precision']:.4f} | event-F1={event['event_f1']:.4f} | "
             f"FA/h={event['fa_per_hour']:.3f} | "
             f"median latency={event['median_latency_sec']:.2f}s | ECE={ece:.4f}"
         )
@@ -364,6 +446,7 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
         checkpoint_path = RESULTS_DIR / f"dynagat_onset_fold_{fold_idx + 1:02d}_{fold_name}.pt"
         torch.save(
             {
+                "model_version": "causal_v3",
                 "model_state_dict": model.state_dict(),
                 "test_subjects": test_subjects,
                 "validation_subjects": val_subjects,
@@ -374,6 +457,9 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
             checkpoint_path,
         )
 
+        prediction_path = RESULTS_DIR / f"fold_{fold_idx + 1:02d}_test_predictions.npz"
+        save_prediction_bundle(test_pred, prediction_path, threshold, test_subjects)
+
         results.append(
             {
                 "fold": fold_idx + 1,
@@ -382,12 +468,18 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
                 "threshold": threshold,
                 "val_auroc": val_window["auroc"],
                 "val_auprc": val_window["auprc"],
+                "val_event_sensitivity": val_event["event_sensitivity"],
+                "val_event_precision": val_event["event_precision"],
+                "val_event_f1": val_event["event_f1"],
+                "val_fa_per_hour": val_event["fa_per_hour"],
                 "auroc": test_window["auroc"],
                 "auprc": test_window["auprc"],
                 "f1": test_window["f1"],
                 "gt_seizures": event["total_gt_seizures"],
                 "detected_seizures": event["detected_seizures"],
                 "event_sensitivity": event["event_sensitivity"],
+                "event_precision": event["event_precision"],
+                "event_f1": event["event_f1"],
                 "false_alarms": event["false_alarms"],
                 "recording_hours": event["recording_hours"],
                 "fa_per_hour": event["fa_per_hour"],
@@ -413,11 +505,14 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
     print(df.to_string(index=False))
     print("-" * 80)
     for column in [
-        "auroc", "auprc", "event_sensitivity", "fa_per_hour", "median_latency_sec", "ece"
+        "auroc",
+        "auprc",
+        "event_sensitivity",
+        "event_precision",
+        "event_f1",
+        "fa_per_hour",
+        "median_latency_sec",
+        "ece",
     ]:
         print(f"mean {column:24s}: {df[column].mean(skipna=True):.4f}")
     print(f"[+] Results: {RESULTS_DIR / 'lopo_results_summary.csv'}")
-
-
-if __name__ == "__main__":
-    run_lopo()
