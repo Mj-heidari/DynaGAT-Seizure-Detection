@@ -9,11 +9,13 @@ import torch
 from torch.utils.data import Dataset
 
 from config import (
+    CACHE_VERSION,
     EVAL_SEQUENCE_STRIDE,
     MIN_NEGATIVE_CLIPS_PER_EPOCH,
     NEGATIVE_TO_IMPORTANT_RATIO,
     NODE_FEATURE_DIM,
     NUM_NODES,
+    PREPROCESSING_TAG,
     RANDOM_SEED,
     SEQUENCE_LENGTH,
     TOP_K_DYNAMIC,
@@ -30,24 +32,54 @@ class ClipRef:
 
 
 def load_temporal_cache(path: Path) -> Dict:
-    """Load and minimally validate a v2 temporal cache."""
+    """Load and strictly validate a current v3 temporal cache."""
     kwargs = dict(map_location="cpu", weights_only=False)
     try:
         cache = torch.load(path, mmap=True, **kwargs)
     except (TypeError, RuntimeError):
         cache = torch.load(path, **kwargs)
 
-    if int(cache.get("cache_version", -1)) != 2:
+    version = int(cache.get("cache_version", -1))
+    if version != CACHE_VERSION:
         raise RuntimeError(
-            f"{path.name} is not a v2 temporal cache. Rebuild it with run_preprocessing.py"
+            f"{path.name} has cache_version={version}; expected {CACHE_VERSION}. "
+            "Rebuild from raw CHB-MIT with run_preprocessing.py --overwrite."
         )
 
-    required = {"subject", "recordings", "feature_sum", "feature_sumsq", "feature_count"}
+    tag = str(cache.get("preprocessing_tag", ""))
+    if tag != PREPROCESSING_TAG:
+        raise RuntimeError(
+            f"{path.name} preprocessing tag mismatch: {tag!r} != {PREPROCESSING_TAG!r}. "
+            "Rebuild the cache from raw EEG."
+        )
+
+    feature_dim = int(cache.get("node_feature_dim", -1))
+    if feature_dim != NODE_FEATURE_DIM:
+        raise RuntimeError(
+            f"{path.name} has node_feature_dim={feature_dim}; expected {NODE_FEATURE_DIM}."
+        )
+
+    required = {
+        "subject",
+        "recordings",
+        "feature_sum",
+        "feature_sumsq",
+        "feature_count",
+    }
     missing = sorted(required.difference(cache))
     if missing:
         raise RuntimeError(f"{path.name} is missing cache fields: {missing}")
     if int(cache.get("feature_count", 0)) <= 0 or not cache.get("recordings"):
         raise RuntimeError(f"{path.name} contains no valid recording features")
+    if cache["feature_sum"].numel() != NODE_FEATURE_DIM:
+        raise RuntimeError(f"{path.name} feature statistics have the wrong dimension")
+
+    for rec in cache["recordings"]:
+        x = rec.get("x")
+        if x is None or x.ndim != 3 or x.shape[1:] != (NUM_NODES, NODE_FEATURE_DIM):
+            raise RuntimeError(
+                f"{path.name} contains an incompatible recording tensor shape"
+            )
 
     return cache
 
