@@ -2,34 +2,26 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+
 import torch
 
-# -----------------------------------------------------------------------------
-# Paths / experiment versioning
-# -----------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent
 
-# Override with environment variable CHBMIT_BIDS_ROOT if your dataset is elsewhere.
+PROJECT_ROOT = Path(__file__).resolve().parent
 _DEFAULT_BIDS_ROOT = r"D:\EEG_Dataset\CHB_MIT\BIDS_CHB-MIT\BIDS_CHB-MIT"
 BIDS_ROOT = Path(os.environ.get("CHBMIT_BIDS_ROOT", _DEFAULT_BIDS_ROOT))
 
-# v3 is intentionally isolated from every previous cache. Old caches are never
-# considered compatible with the current preprocessing / feature schema.
 CACHE_VERSION = 3
 PREPROCESSING_TAG = "causal_v3_features20_hybrid_connectivity"
 PROCESSED_DATA_DIR = Path(
     os.environ.get("DYNAGAT_CACHE_DIR", str(PROJECT_ROOT / "data_cache_v3"))
 )
-PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 RESULTS_DIR = Path(os.environ.get("DYNAGAT_RESULTS_DIR", str(PROJECT_ROOT / "results")))
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+PAPER_FIGURES_DIR = PROJECT_ROOT / "paper_figures"
+PAPER_TABLES_DIR = PROJECT_ROOT / "paper_tables"
+PAPER_RESULTS_DIR = PROJECT_ROOT / "paper_results"
+for directory in (PROCESSED_DATA_DIR, RESULTS_DIR, PAPER_FIGURES_DIR, PAPER_TABLES_DIR, PAPER_RESULTS_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
 
-# -----------------------------------------------------------------------------
-# EEG preprocessing / graph specification
-# -----------------------------------------------------------------------------
-# CHB-MIT is natively sampled at 256 Hz. Unexpected sampling rates are rejected
-# rather than silently resampled, preserving the strictly causal signal path.
 SFREQ = 256.0
 WINDOW_SEC = 2.0
 WINDOW_STRIDE_SEC = 1.0
@@ -57,17 +49,7 @@ STATIC_EDGE_INDEX = [
 
 TOP_K_DYNAMIC = 4
 NUM_NODES = 18
-
-# Per-node feature schema (20 features):
-#   5 relative spectral band powers
-#   6 Hjorth / time-domain statistics
-#   4 spectral-shape statistics
-#   5 log-covariance connectivity summaries
 NODE_FEATURE_DIM = 20
-
-# Dynamic graph edge score combines phase-lag synchrony (wPLI) with a smaller
-# absolute-correlation contribution. This retains wPLI robustness while not
-# discarding clinically useful near-zero-lag hypersynchrony.
 DYNAMIC_WPLI_WEIGHT = 0.75
 DYNAMIC_CORR_WEIGHT = 0.25
 
@@ -83,58 +65,40 @@ def get_static_edge_tensor() -> torch.Tensor:
     return torch.tensor([src, dst], dtype=torch.long)
 
 
-# -----------------------------------------------------------------------------
-# Temporal model / training defaults
-# -----------------------------------------------------------------------------
-SEQUENCE_LENGTH = 16               # ~17 s span with 1-second window strides
+SEQUENCE_LENGTH = 16
 TRAIN_SEQUENCE_STRIDE = 16
-# Overlap during evaluation gives each physical window more causal history;
-# duplicate predictions are resolved by keeping the largest past context.
 EVAL_SEQUENCE_STRIDE = 8
-
 GRAPH_HIDDEN = 96
 GAT_HEADS = 4
 TCN_HIDDEN = 96
 DROPOUT = 0.25
 
-# Conservative default for RTX 3060-class GPUs; CLI can override this. Actual
-# peak allocation is logged every epoch so throughput can be tuned empirically.
 BATCH_SIZE = 32
 EPOCHS = 30
 LEARNING_RATE = 8e-4
 WEIGHT_DECAY = 1e-4
 MAX_GRAD_NORM = 1.0
-
-# Validation checkpoint selection. The test patient remains completely untouched.
 VALIDATION_CHECK_INTERVAL = 5
 MIN_EPOCHS_BEFORE_STOPPING = 15
 EARLY_STOPPING_PATIENCE = 3
 
-# Dynamic negative sampling keeps expensive graph computation focused while each
-# epoch sees a different background subset.
 NEGATIVE_TO_IMPORTANT_RATIO = 6
 MIN_NEGATIVE_CLIPS_PER_EPOCH = 512
 RANDOM_SEED = 42
-
-# Boundary-aware focal loss
 FOCAL_ALPHA = 0.75
 FOCAL_GAMMA = 2.0
 
-# Event-level alarm policy. The operating point is selected on validation only:
-# threshold and persistence are searched jointly, subject to an explicit FAR cap.
-# The selected pair is then frozen and applied unchanged to the held-out patient.
-MIN_CONSECUTIVE_POSITIVE_WINDOWS = 3  # backward-compatible fallback/default
 EVENT_PERSISTENCE_CANDIDATES = (1, 2, 3)
 VALIDATION_FA_PER_HOUR_CAP = 0.5
 ALARM_REFRACTORY_SEC = 30.0
 EVENT_THRESHOLD_MAX_CANDIDATES = 81
-
-# Chunked preprocessing keeps the pairwise phase-interaction tensor bounded on
-# RTX 3060-class GPUs while preserving identical numerical results across chunks.
+MIN_CONSECUTIVE_POSITIVE_WINDOWS = 3
 PREPROCESS_CHUNK_WINDOWS = 256
 
-# Known CHB-MIT identity linkage. PhysioNet notes that chb21 and chb01 are the
-# same subject recorded at different times; grouping prevents patient leakage.
+DEVELOPMENT_FOLD = 1
+BOOTSTRAP_REPLICATES = 5000
+BOOTSTRAP_SEED = 2026
+
 LINKED_SUBJECT_GROUPS = [
     {"sub-01", "sub-21"},
     {"chb01", "chb21"},
