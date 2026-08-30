@@ -44,7 +44,9 @@ def select_f1_threshold(labels: np.ndarray, probs: np.ndarray) -> float:
     if thresholds.size == 0:
         return 0.5
 
-    f1 = 2.0 * precision[:-1] * recall[:-1] / np.maximum(precision[:-1] + recall[:-1], 1e-12)
+    f1 = 2.0 * precision[:-1] * recall[:-1] / np.maximum(
+        precision[:-1] + recall[:-1], 1e-12
+    )
     return float(thresholds[int(np.nanargmax(f1))])
 
 
@@ -118,6 +120,33 @@ def _predicted_events(
     return merged
 
 
+def _union_interval_duration(
+    intervals: Sequence[Tuple[float, float]],
+    recording_duration_sec: float,
+) -> float:
+    """Duration of the union of seizure intervals, clipped to recording bounds."""
+    clipped = []
+    for start, end in intervals:
+        start = max(0.0, min(float(start), recording_duration_sec))
+        end = max(0.0, min(float(end), recording_duration_sec))
+        if end > start:
+            clipped.append((start, end))
+    if not clipped:
+        return 0.0
+
+    clipped.sort()
+    total = 0.0
+    cur_start, cur_end = clipped[0]
+    for start, end in clipped[1:]:
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
+        else:
+            total += cur_end - cur_start
+            cur_start, cur_end = start, end
+    total += cur_end - cur_start
+    return float(total)
+
+
 def compute_event_metrics(
     probs: np.ndarray,
     recording_ids: Sequence[str],
@@ -130,7 +159,7 @@ def compute_event_metrics(
     stride_sec: float = WINDOW_STRIDE_SEC,
     window_sec: float = WINDOW_SEC,
 ) -> Dict[str, float]:
-    """Compute clinically relevant event metrics independently for every EDF."""
+    """Compute event sensitivity, event precision, FA/hour, and onset latency per EDF."""
     probs = np.asarray(probs, dtype=np.float64)
     window_indices = np.asarray(window_indices, dtype=np.int64)
     recording_ids = np.asarray(recording_ids, dtype=object)
@@ -140,11 +169,16 @@ def compute_event_metrics(
     false_alarms = 0
     latencies: List[float] = []
     total_duration_sec = 0.0
-    refractory_windows = max(0, int(round(refractory_sec / max(stride_sec, 1e-12))))
+    total_seizure_duration_sec = 0.0
+    refractory_windows = max(
+        0, int(round(refractory_sec / max(stride_sec, 1e-12)))
+    )
 
     for rid, meta in recording_metadata.items():
-        total_duration_sec += float(meta.get("duration_sec", 0.0))
+        duration_sec = max(0.0, float(meta.get("duration_sec", 0.0)))
         seizures = [tuple(x) for x in meta.get("seizure_intervals", [])]
+        total_duration_sec += duration_sec
+        total_seizure_duration_sec += _union_interval_duration(seizures, duration_sec)
         total_gt += len(seizures)
 
         mask = recording_ids == rid
@@ -161,7 +195,9 @@ def compute_event_metrics(
         segments: List[Tuple[np.ndarray, np.ndarray]] = []
         if len(idx):
             split_points = np.where(np.diff(idx) != 1)[0] + 1
-            segments = list(zip(np.split(idx, split_points), np.split(rec_probs, split_points)))
+            segments = list(
+                zip(np.split(idx, split_points), np.split(rec_probs, split_points))
+            )
 
         pred_intervals: List[Tuple[float, float, float]] = []
         for seg_idx, seg_probs in segments:
@@ -186,8 +222,8 @@ def compute_event_metrics(
             for p_idx, (_pred_start, _pred_end, alarm_time) in enumerate(pred_intervals):
                 if p_idx in matched_predictions:
                     continue
-                # A long-running false alarm that started far before the seizure is
-                # not converted into a true detection just because it overlaps it.
+                # Permit only the small early offset caused by the analysis window.
+                # A long-running alarm from far before onset cannot become a TP.
                 if (
                     alarm_time >= seizure_start - early_tolerance_sec
                     and alarm_time <= seizure_end
@@ -198,12 +234,24 @@ def compute_event_metrics(
                 alarm_time, p_idx = min(candidates, key=lambda item: item[0])
                 detected_gt += 1
                 matched_predictions.add(p_idx)
-                # Small negative offsets can arise from the 2-s analysis window.
                 latencies.append(max(0.0, float(alarm_time - seizure_start)))
 
-        false_alarms += max(0, len(pred_intervals) - len(matched_predictions))
+        # Duplicate alarms during an annotated seizure are not false alarms. A false
+        # alarm is an emitted alarm whose trigger time is outside every seizure
+        # interval (apart from the explicit small early tolerance).
+        for _pred_start, _pred_end, alarm_time in pred_intervals:
+            is_seizure_alarm = any(
+                alarm_time >= seizure_start - early_tolerance_sec
+                and alarm_time <= seizure_end
+                for seizure_start, seizure_end in seizures
+            )
+            if not is_seizure_alarm:
+                false_alarms += 1
 
-    hours = total_duration_sec / 3600.0
+    recording_hours = total_duration_sec / 3600.0
+    interictal_duration_sec = max(0.0, total_duration_sec - total_seizure_duration_sec)
+    interictal_hours = interictal_duration_sec / 3600.0
+
     sensitivity = detected_gt / total_gt if total_gt > 0 else float("nan")
     event_precision = (
         detected_gt / (detected_gt + false_alarms)
@@ -225,8 +273,9 @@ def compute_event_metrics(
         "event_precision": float(event_precision),
         "event_f1": float(event_f1),
         "false_alarms": int(false_alarms),
-        "recording_hours": float(hours),
-        "fa_per_hour": float(false_alarms / max(hours, 1e-12)),
+        "recording_hours": float(recording_hours),
+        "interictal_hours": float(interictal_hours),
+        "fa_per_hour": float(false_alarms / max(interictal_hours, 1e-12)),
         "median_latency_sec": median_latency,
     }
 
@@ -250,7 +299,8 @@ def select_event_threshold(
     fallback = select_f1_threshold(labels, probs)
 
     total_gt = sum(
-        len(meta.get("seizure_intervals", [])) for meta in recording_metadata.values()
+        len(meta.get("seizure_intervals", []))
+        for meta in recording_metadata.values()
     )
     finite = probs[np.isfinite(probs)]
     if total_gt <= 0 or finite.size == 0:
@@ -259,12 +309,18 @@ def select_event_threshold(
     quantiles = np.quantile(finite, np.linspace(0.50, 0.999, 41))
     linear = np.linspace(0.02, 0.98, 49)
     candidates = np.unique(
-        np.clip(np.concatenate([quantiles, linear, [fallback, 0.5]]), 1e-4, 1.0 - 1e-4)
+        np.clip(
+            np.concatenate([quantiles, linear, [fallback, 0.5]]),
+            1e-4,
+            1.0 - 1e-4,
+        )
     )
 
     if candidates.size > max_candidates:
         keep = np.linspace(0, candidates.size - 1, max_candidates, dtype=int)
-        candidates = np.unique(np.concatenate([candidates[keep], [fallback, 0.5]]))
+        candidates = np.unique(
+            np.concatenate([candidates[keep], [fallback, 0.5]])
+        )
 
     best_threshold = float(fallback)
     best_score = (-1.0, -1.0, -float("inf"), -float("inf"))
