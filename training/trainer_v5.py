@@ -4,7 +4,7 @@ import gc
 import json
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import numpy as np
 import pandas as pd
@@ -92,10 +92,69 @@ def _save_predictions_v5(
     )
 
 
+def _selected_fold_indices(
+    n_groups: int,
+    max_folds: int | None,
+    folds: Sequence[int] | None,
+) -> List[int]:
+    if folds is not None:
+        selected = sorted({int(fold) for fold in folds})
+        if not selected:
+            raise ValueError("folds must not be empty")
+        invalid = [fold for fold in selected if fold < 1 or fold > n_groups]
+        if invalid:
+            raise ValueError(
+                f"Requested fold(s) outside 1..{n_groups}: {invalid}"
+            )
+        return [fold - 1 for fold in selected]
+
+    if max_folds is not None:
+        if max_folds < 1:
+            raise ValueError("max_folds must be >= 1")
+        return list(range(min(int(max_folds), n_groups)))
+
+    return list(range(n_groups))
+
+
+def _load_existing_v5_results(summary_path: Path) -> Dict[int, Dict]:
+    if not summary_path.exists():
+        return {}
+    try:
+        df = pd.read_csv(summary_path)
+    except Exception as exc:
+        print(f"[warn] Could not read existing summary for merge: {exc}")
+        return {}
+
+    if "fold" not in df.columns:
+        return {}
+    if "model_version" in df.columns:
+        df = df[df["model_version"].astype(str) == MODEL_VERSION]
+    elif not df.empty:
+        # A pre-v5 summary must never be silently mixed with v5 results.
+        return {}
+
+    rows: Dict[int, Dict] = {}
+    for row in df.to_dict(orient="records"):
+        try:
+            rows[int(row["fold"])] = row
+        except (TypeError, ValueError, KeyError):
+            continue
+    return rows
+
+
+def _write_merged_results(summary_path: Path, rows_by_fold: Dict[int, Dict]) -> pd.DataFrame:
+    if not rows_by_fold:
+        return pd.DataFrame()
+    df = pd.DataFrame([rows_by_fold[key] for key in sorted(rows_by_fold)])
+    df.to_csv(summary_path, index=False)
+    return df
+
+
 def run_lopo_v5(
     max_folds: int | None = None,
     epochs: int = EPOCHS,
     batch_size: int = BATCH_SIZE,
+    folds: Sequence[int] | None = None,
 ) -> None:
     seed_everything(RANDOM_SEED)
     _hardware_summary()
@@ -117,18 +176,28 @@ def run_lopo_v5(
         raise RuntimeError("LOPO requires at least 3 independent patient groups")
 
     validation_size = min(4, len(groups) - 2)
-    run_groups = groups[:max_folds] if max_folds is not None else groups
+    selected_indices = _selected_fold_indices(len(groups), max_folds, folds)
+    selected_folds = [idx + 1 for idx in selected_indices]
+    summary_path = RESULTS_DIR / "lopo_results_summary.csv"
+    results_by_fold = _load_existing_v5_results(summary_path)
+
     print(f"[*] Independent patient groups: {len(groups)}")
+    print(f"[*] Selected held-out folds: {selected_folds}")
     print(f"[*] Inner validation groups per fold: {validation_size}")
     print(
-        f"[*] Alarm policy: validation-only joint threshold/persistence selection, "
+        f"[*] Frozen alarm policy: validation-only sensitivity-first threshold/persistence selection, "
         f"FA/h cap={VALIDATION_FA_PER_HOUR_CAP:.3f}"
     )
-    print("[*] Held-out test patient is never used for normalization or selection.\n")
+    print("[*] Held-out test patient is never used for normalization or selection.")
+    if results_by_fold:
+        print(
+            f"[*] Existing v5 summary contains folds {sorted(results_by_fold)}; "
+            "completed selected folds will replace only their own rows."
+        )
+    print()
 
-    results: List[Dict] = []
-
-    for fold_idx, test_group in enumerate(run_groups):
+    for fold_idx in selected_indices:
+        test_group = groups[fold_idx]
         validation_indices = [
             (fold_idx + offset) % len(groups)
             for offset in range(1, validation_size + 1)
@@ -141,9 +210,13 @@ def run_lopo_v5(
         val_subjects = [s for group in val_groups for s in group]
         test_subjects = list(test_group)
         fold_name = "+".join(test_subjects)
+        fold_number = fold_idx + 1
 
         print("\n" + "=" * 88)
-        print(f"FOLD {fold_idx + 1:02d}/{len(run_groups):02d} | TEST={test_subjects} | VAL={val_subjects}")
+        print(
+            f"FOLD {fold_number:02d}/{len(groups):02d} | "
+            f"TEST={test_subjects} | VAL={val_subjects}"
+        )
         print("=" * 88)
 
         train_caches = caches_for_subjects(cache_by_subject, train_subjects)
@@ -271,13 +344,13 @@ def run_lopo_v5(
         del best_state
 
         pd.DataFrame(history).to_csv(
-            RESULTS_DIR / f"fold_{fold_idx + 1:02d}_training_history.csv",
+            RESULTS_DIR / f"fold_{fold_number:02d}_training_history.csv",
             index=False,
         )
 
-        # Final operating point is chosen exclusively from full validation streams.
+        # Final operating point: frozen sensitivity-first rule on validation only.
         val_pred = predict(model, val_loader)
-        frontier_path = RESULTS_DIR / f"fold_{fold_idx + 1:02d}_validation_alarm_frontier.csv"
+        frontier_path = RESULTS_DIR / f"fold_{fold_number:02d}_validation_alarm_frontier.csv"
         operating = select_validation_operating_point(
             labels=val_pred.labels,
             probs=val_pred.probs,
@@ -329,7 +402,7 @@ def run_lopo_v5(
             f"ECE={ece:.4f}"
         )
 
-        checkpoint_path = RESULTS_DIR / f"dynagat_v5_fold_{fold_idx + 1:02d}_{fold_name}.pt"
+        checkpoint_path = RESULTS_DIR / f"dynagat_v5_fold_{fold_number:02d}_{fold_name}.pt"
         torch.save(
             {
                 "model_version": MODEL_VERSION,
@@ -341,6 +414,7 @@ def run_lopo_v5(
                 "validation_threshold": threshold,
                 "validation_min_consecutive_windows": persistence,
                 "validation_far_cap": VALIDATION_FA_PER_HOUR_CAP,
+                "alarm_objective": "sensitivity_first_under_validation_far_cap",
                 "operating_point_feasible_under_cap": operating.feasible_under_cap,
                 "best_epoch": best_epoch,
                 "best_quick_val_auprc": best_score,
@@ -350,48 +424,48 @@ def run_lopo_v5(
 
         _save_predictions_v5(
             test_pred,
-            RESULTS_DIR / f"fold_{fold_idx + 1:02d}_test_predictions.npz",
+            RESULTS_DIR / f"fold_{fold_number:02d}_test_predictions.npz",
             threshold,
             persistence,
             test_subjects,
         )
 
-        results.append(
-            {
-                "fold": fold_idx + 1,
-                "model_version": MODEL_VERSION,
-                "test_patient": fold_name,
-                "validation_patient": "+".join(val_subjects),
-                "best_epoch": best_epoch,
-                "epochs_ran": epochs_ran,
-                "best_quick_val_auprc": best_score,
-                "threshold": threshold,
-                "min_consecutive_windows": persistence,
-                "validation_far_cap": VALIDATION_FA_PER_HOUR_CAP,
-                "val_auroc": val_window["auroc"],
-                "val_auprc": val_window["auprc"],
-                "val_event_sensitivity": val_event["event_sensitivity"],
-                "val_event_precision": val_event["event_precision"],
-                "val_event_f1": val_event["event_f1"],
-                "val_fa_per_hour": val_event["fa_per_hour"],
-                "auroc": test_window["auroc"],
-                "auprc": test_window["auprc"],
-                "f1": test_window["f1"],
-                "gt_seizures": event["total_gt_seizures"],
-                "detected_seizures": event["detected_seizures"],
-                "event_sensitivity": event["event_sensitivity"],
-                "event_precision": event["event_precision"],
-                "event_f1": event["event_f1"],
-                "false_alarms": event["false_alarms"],
-                "recording_hours": event["recording_hours"],
-                "interictal_hours": event["interictal_hours"],
-                "fa_per_hour": event["fa_per_hour"],
-                "median_latency_sec": event["median_latency_sec"],
-                "ece": ece,
-                "elapsed_sec": elapsed,
-            }
-        )
-        pd.DataFrame(results).to_csv(RESULTS_DIR / "lopo_results_summary.csv", index=False)
+        result_row = {
+            "fold": fold_number,
+            "model_version": MODEL_VERSION,
+            "alarm_objective": "sensitivity_first_under_validation_far_cap",
+            "test_patient": fold_name,
+            "validation_patient": "+".join(val_subjects),
+            "best_epoch": best_epoch,
+            "epochs_ran": epochs_ran,
+            "best_quick_val_auprc": best_score,
+            "threshold": threshold,
+            "min_consecutive_windows": persistence,
+            "validation_far_cap": VALIDATION_FA_PER_HOUR_CAP,
+            "val_auroc": val_window["auroc"],
+            "val_auprc": val_window["auprc"],
+            "val_event_sensitivity": val_event["event_sensitivity"],
+            "val_event_precision": val_event["event_precision"],
+            "val_event_f1": val_event["event_f1"],
+            "val_fa_per_hour": val_event["fa_per_hour"],
+            "auroc": test_window["auroc"],
+            "auprc": test_window["auprc"],
+            "f1": test_window["f1"],
+            "gt_seizures": event["total_gt_seizures"],
+            "detected_seizures": event["detected_seizures"],
+            "event_sensitivity": event["event_sensitivity"],
+            "event_precision": event["event_precision"],
+            "event_f1": event["event_f1"],
+            "false_alarms": event["false_alarms"],
+            "recording_hours": event["recording_hours"],
+            "interictal_hours": event["interictal_hours"],
+            "fa_per_hour": event["fa_per_hour"],
+            "median_latency_sec": event["median_latency_sec"],
+            "ece": ece,
+            "elapsed_sec": elapsed,
+        }
+        results_by_fold[fold_number] = result_row
+        _write_merged_results(summary_path, results_by_fold)
 
         del model, optimizer, scheduler, train_loader, val_quick_loader, val_loader, test_loader
         del train_ds, val_quick_ds, val_ds, test_ds, val_pred, test_pred
@@ -399,10 +473,13 @@ def run_lopo_v5(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    df = pd.DataFrame(results)
+    df = _write_merged_results(summary_path, results_by_fold)
     print("\n" + "=" * 88)
-    print("LOPO V5 COMPLETE")
+    print("LOPO V5 COMPLETE / MERGED SUMMARY")
     print("=" * 88)
+    if df.empty:
+        print("No v5 results available.")
+        return
     print(df.to_string(index=False))
     print("-" * 88)
     for column in [
@@ -415,5 +492,6 @@ def run_lopo_v5(
         "median_latency_sec",
         "ece",
     ]:
-        print(f"mean {column:24s}: {df[column].mean(skipna=True):.4f}")
-    print(f"[+] Results: {RESULTS_DIR / 'lopo_results_summary.csv'}")
+        if column in df.columns:
+            print(f"mean {column:24s}: {df[column].mean(skipna=True):.4f}")
+    print(f"[+] Results: {summary_path}")
