@@ -48,6 +48,21 @@ BANDS = [
     (30.0, 45.0),
 ]
 
+# Used only as a full-dataset QA warning, never as a hard requirement. PhysioNet
+# CHB-MIT v1.0.0 documents 664 EDF files and 198 annotated seizures.
+EXPECTED_CHBMIT_EDF_FILES = 664
+EXPECTED_CHBMIT_SEIZURES = 198
+
+
+def _events_path_for_edf(edf_path: Path) -> Path:
+    """Resolve the standard BIDS events.tsv sibling for an EEG EDF file."""
+    if edf_path.name.endswith("_eeg.edf"):
+        return edf_path.with_name(edf_path.name.replace("_eeg.edf", "_events.tsv"))
+    stem = edf_path.stem
+    if stem.endswith("_eeg"):
+        stem = stem[:-4]
+    return edf_path.with_name(stem + "_events.tsv")
+
 
 def parse_seizure_events(tsv_path: Path) -> List[Tuple[float, float]]:
     """Parse seizure intervals from a BIDS events.tsv file."""
@@ -120,9 +135,10 @@ def _pick_canonical_channels(raw: mne.io.BaseRaw) -> mne.io.BaseRaw | None:
     if missing:
         return None
 
-    picked = raw.copy().pick(selected)
-    picked.rename_channels(rename)
-    return picked
+    # raw is local to clean_raw, so mutating it avoids an unnecessary full-data copy.
+    raw.pick(selected)
+    raw.rename_channels(rename)
+    return raw
 
 
 def _causal_bandpass(data_v: np.ndarray, sfreq: float) -> np.ndarray:
@@ -135,21 +151,26 @@ def _causal_bandpass(data_v: np.ndarray, sfreq: float) -> np.ndarray:
         output="sos",
     )
     zi_template = signal.sosfilt_zi(sos)
-    filtered = np.empty_like(data_v, dtype=np.float64)
+    filtered = np.empty(data_v.shape, dtype=np.float32)
+
     for channel in range(data_v.shape[0]):
         x = np.asarray(data_v[channel], dtype=np.float64)
         zi = zi_template * float(x[0])
-        filtered[channel], _ = signal.sosfilt(sos, x, zi=zi)
-    return filtered.astype(np.float32, copy=False)
+        y, _ = signal.sosfilt(sos, x, zi=zi)
+        filtered[channel] = y.astype(np.float32, copy=False)
+
+    return filtered
 
 
 def clean_raw(edf_path: Path) -> np.ndarray | None:
     """
-    Read one EDF, select canonical bipolar channels, apply strictly causal
-    filtering, and return microvolt data for numerically stable feature extraction.
+    Read one EDF, load only the selected montage, apply causal filtering, and
+    return microvolt data for numerically stable feature extraction.
     """
     try:
-        raw = mne.io.read_raw_edf(str(edf_path), preload=True, verbose="ERROR")
+        # Metadata are cheap to read. Selecting channels before load_data avoids
+        # preloading ECG/VNS/dummy channels and reduces RAM/I/O on long recordings.
+        raw = mne.io.read_raw_edf(str(edf_path), preload=False, verbose="ERROR")
         picked = _pick_canonical_channels(raw)
         if picked is None:
             available = [_normalize_channel_name(ch) for ch in raw.ch_names]
@@ -163,21 +184,21 @@ def clean_raw(edf_path: Path) -> np.ndarray | None:
 
         sfreq = float(picked.info["sfreq"])
         if not np.isclose(sfreq, SFREQ, rtol=0.0, atol=1e-6):
-            # Native CHB-MIT is 256 Hz. Silent resampling would introduce another
-            # temporal operator and can compromise strict causal interpretation.
             print(
                 f"[skip] {edf_path.name}: unexpected sfreq={sfreq:g} Hz; "
                 f"expected native CHB-MIT {SFREQ:g} Hz"
             )
             return None
 
-        data_v = picked.get_data().astype(np.float32, copy=False)
-        filtered_v = _causal_bandpass(data_v, sfreq)
-        data_uv = filtered_v * 1e6
-        if not np.isfinite(data_uv).all():
+        picked.load_data()
+        data_v = picked.get_data()
+        filtered_uv = _causal_bandpass(data_v, sfreq)
+        filtered_uv *= 1e6
+
+        if not np.isfinite(filtered_uv).all():
             print(f"[skip] {edf_path.name}: non-finite samples after filtering")
             return None
-        return np.ascontiguousarray(data_uv, dtype=np.float32)
+        return np.ascontiguousarray(filtered_uv, dtype=np.float32)
     except Exception as exc:
         print(f"[skip] {edf_path.name}: {exc}")
         return None
@@ -215,9 +236,6 @@ def _extract_feature_chunk(
     if channels != NUM_NODES:
         raise ValueError(f"Expected {NUM_NODES} channels, got {channels}")
 
-    # ------------------------------------------------------------------
-    # Spectral representation with a Hann taper.
-    # ------------------------------------------------------------------
     taper = torch.hann_window(
         win_len, periodic=False, device=wins.device, dtype=wins.dtype
     ).view(1, 1, -1)
@@ -237,8 +255,7 @@ def _extract_feature_chunk(
         bp_features.append(relative.clamp_min(1e-8).log())
     bandpower = torch.cat(bp_features, dim=-1)
 
-    # 2) Six Hjorth / time-domain features. Data are in microvolts, avoiding the
-    # near-zero fp16 collapse that occurs when these are computed in volts.
+    # 2) Six Hjorth / time-domain features in microvolts.
     d1 = torch.diff(wins, dim=-1)
     d2 = torch.diff(d1, dim=-1)
     var0 = torch.var(wins, dim=-1, keepdim=True, unbiased=False).clamp_min(1e-8)
@@ -250,9 +267,9 @@ def _extract_feature_chunk(
     complexity = torch.sqrt(var2 / var1) / mobility.clamp_min(1e-8)
     line_length = torch.log1p(torch.mean(torch.abs(d1), dim=-1, keepdim=True))
     rms = torch.log1p(torch.sqrt(torch.mean(wins.square(), dim=-1, keepdim=True)))
+    sign = torch.signbit(wins)
     zero_cross = (
-        torch.diff(torch.signbit(wins), dim=-1)
-        .ne(0)
+        torch.logical_xor(sign[..., 1:], sign[..., :-1])
         .sum(dim=-1, keepdim=True)
         .float()
         / float(max(1, win_len - 1))
@@ -261,7 +278,7 @@ def _extract_feature_chunk(
         [activity, mobility, complexity, line_length, rms, zero_cross], dim=-1
     )
 
-    # 3) Four spectral-shape statistics.
+    # 3) Four spectral-shape features.
     spectral_prob = total_band_power / total_power
     spectral_entropy = -(
         spectral_prob * spectral_prob.clamp_min(1e-12).log()
@@ -271,9 +288,7 @@ def _extract_feature_chunk(
     ).sum(dim=-1, keepdim=True) / BANDPASS_HFREQ
     cdf = spectral_prob.cumsum(dim=-1)
     edge_idx = (cdf >= 0.90).to(torch.int64).argmax(dim=-1)
-    spectral_edge = (
-        total_freqs[edge_idx].unsqueeze(-1) / BANDPASS_HFREQ
-    )
+    spectral_edge = total_freqs[edge_idx].unsqueeze(-1) / BANDPASS_HFREQ
     flatness = (
         total_band_power.log().mean(dim=-1, keepdim=True).exp()
         / total_band_power.mean(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -282,9 +297,7 @@ def _extract_feature_chunk(
         [spectral_entropy, centroid, spectral_edge, flatness], dim=-1
     )
 
-    # ------------------------------------------------------------------
-    # Covariance-domain summaries and correlation connectivity.
-    # ------------------------------------------------------------------
+    # 4) Five log-covariance features and correlation connectivity.
     centered = wins - wins.mean(dim=-1, keepdim=True)
     cov = torch.bmm(centered, centered.transpose(1, 2)) / float(max(1, win_len - 1))
     diag_mean = torch.diagonal(cov, dim1=1, dim2=2).mean(dim=-1).clamp_min(1e-6)
@@ -325,10 +338,7 @@ def _extract_feature_chunk(
     corr = torch.bmm(z, z.transpose(1, 2)) / float(win_len)
     abs_corr = corr.abs().clamp(0.0, 1.0)
 
-    # ------------------------------------------------------------------
-    # wPLI: |E[Im(Sxy)]| / E[|Im(Sxy)|]. The final edge score is a robust
-    # wPLI-dominant hybrid with absolute correlation.
-    # ------------------------------------------------------------------
+    # wPLI: |E[Im(Sxy)]| / E[|Im(Sxy)|]
     spectrum = torch.fft.fft(wins, dim=-1)
     hilbert_filter = torch.zeros(win_len, dtype=wins.dtype, device=wins.device)
     hilbert_filter[0] = 1.0
@@ -408,8 +418,6 @@ def extract_recording(
         feature_sumsq += features_cpu.double().square().sum(dim=(0, 1))
         feature_count += int(features_cpu.shape[0] * features_cpu.shape[1])
 
-        # Compact caches are important because continuous CHB-MIT contains millions
-        # of graph windows. fp16 is safe after the v3 feature rescaling/clamping.
         x_parts.append(features_cpu.to(torch.float16))
         dst_parts.append(dynamic_dst.cpu().to(torch.uint8))
         weight_parts.append(dynamic_weight.cpu().to(torch.float16))
@@ -481,10 +489,13 @@ def build_all_subject_caches(
         positive_windows = 0
         total_seizures = 0
         skipped_recordings = 0
+        event_files_found = 0
 
         pbar = tqdm(edf_files, desc=f"{sub_dir.name}", ncols=100)
         for edf_path in pbar:
-            tsv_path = edf_path.parent / edf_path.name.replace("_eeg.edf", "_events.tsv")
+            tsv_path = _events_path_for_edf(edf_path)
+            if tsv_path.exists():
+                event_files_found += 1
             intervals = parse_seizure_events(tsv_path)
             raw_data = clean_raw(edf_path)
             if raw_data is None:
@@ -508,10 +519,7 @@ def build_all_subject_caches(
             total_windows += rec["n_windows"]
             positive_windows += rec["positive_windows"]
             total_seizures += len(intervals)
-
             del raw_data
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
         if not recordings or subject_count <= 0:
             print(f"[error] {sub_dir.name}: no valid recordings; cache not written")
@@ -533,6 +541,7 @@ def build_all_subject_caches(
             "total_seizures": int(total_seizures),
             "valid_recordings": int(len(recordings)),
             "skipped_recordings": int(skipped_recordings),
+            "event_files_found": int(event_files_found),
             "sampling_rate_hz": float(SFREQ),
             "signal_unit": "microvolt",
         }
@@ -543,6 +552,7 @@ def build_all_subject_caches(
             {
                 "subject": sub_dir.name,
                 "edf_files": len(edf_files),
+                "event_files_found": event_files_found,
                 "valid_recordings": len(recordings),
                 "skipped_recordings": skipped_recordings,
                 "windows": total_windows,
@@ -562,8 +572,30 @@ def build_all_subject_caches(
 
     if manifest_rows:
         manifest_path = PROCESSED_DATA_DIR / "preprocessing_manifest.csv"
-        pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
+        manifest = pd.DataFrame(manifest_rows)
+        manifest.to_csv(manifest_path, index=False)
         print(f"\n[+] Preprocessing manifest: {manifest_path}")
+
+        total_edf = int(manifest["edf_files"].sum())
+        total_valid = int(manifest["valid_recordings"].sum())
+        total_seiz = int(manifest["seizures"].sum())
+        total_hours = float(manifest["recording_hours"].sum())
+        print(
+            f"[*] Dataset QA: EDF={total_edf}, valid={total_valid}, "
+            f"seizures={total_seiz}, hours={total_hours:.2f}"
+        )
+
+        if max_subjects is None:
+            if total_edf != EXPECTED_CHBMIT_EDF_FILES:
+                print(
+                    f"[warn] Full CHB-MIT reference contains {EXPECTED_CHBMIT_EDF_FILES} EDF files; "
+                    f"this BIDS tree exposed {total_edf}. Verify dataset completeness."
+                )
+            if total_seiz != EXPECTED_CHBMIT_SEIZURES:
+                print(
+                    f"[warn] CHB-MIT reference contains {EXPECTED_CHBMIT_SEIZURES} seizures; "
+                    f"parsed BIDS annotations yielded {total_seiz}. Inspect events.tsv conversion before training."
+                )
 
 
 if __name__ == "__main__":
