@@ -18,7 +18,7 @@ from config import (
 
 
 class DualViewGATv2Encoder(nn.Module):
-    """Static montage GATv2 + edge-conditioned functional GATv2 + learned gate."""
+    """Static montage GATv2 + functional GATv2 + learned fusion gate."""
 
     def __init__(
         self,
@@ -86,8 +86,7 @@ class DualViewGATv2Encoder(nn.Module):
         edge_count = base.shape[1]
         offsets = torch.arange(graph_count, device=device, dtype=torch.long) * self.num_nodes
         return (
-            base.unsqueeze(0)
-            + offsets.view(graph_count, 1, 1)
+            base.unsqueeze(0) + offsets.view(graph_count, 1, 1)
         ).permute(1, 0, 2).reshape(2, graph_count * edge_count)
 
     def _build_dynamic_edges(
@@ -95,7 +94,6 @@ class DualViewGATv2Encoder(nn.Module):
         dynamic_dst: torch.Tensor,
         dynamic_weight: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # dynamic_dst / weight: [G, 18, K]
         graph_count = dynamic_dst.shape[0]
         offsets = torch.arange(
             graph_count, device=dynamic_dst.device, dtype=torch.long
@@ -115,16 +113,6 @@ class DualViewGATv2Encoder(nn.Module):
         dynamic_dst: torch.Tensor,
         dynamic_weight: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        x              : [G, 18, F]
-        dynamic_dst    : [G, 18, K]
-        dynamic_weight : [G, 18, K]
-
-        Returns
-        -------
-        fused: [G, D]
-        gate : [G, 1]   (1 -> static, 0 -> dynamic)
-        """
         graph_count = x.shape[0]
         x_flat = x.reshape(graph_count * self.num_nodes, -1)
 
@@ -151,70 +139,27 @@ class DualViewGATv2Encoder(nn.Module):
         return fused, gate
 
 
-class Chomp1d(nn.Module):
-    def __init__(self, chomp_size: int) -> None:
+class CausalConv1d(nn.Module):
+    """1-D convolution that never reads future time steps."""
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int) -> None:
         super().__init__()
-        self.chomp_size = int(chomp_size)
+        self.left_pad = int(kernel_size) - 1
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.chomp_size == 0:
-            return x
-        return x[:, :, :-self.chomp_size].contiguous()
-
-
-class TemporalBlock(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        dilation: int,
-        dropout: float,
-    ) -> None:
-        super().__init__()
-        padding = (kernel_size - 1) * dilation
-        self.net = nn.Sequential(
-            nn.Conv1d(
-                in_channels,
-                out_channels,
-                kernel_size,
-                padding=padding,
-                dilation=dilation,
-            ),
-            Chomp1d(padding),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Conv1d(
-                out_channels,
-                out_channels,
-                kernel_size,
-                padding=padding,
-                dilation=dilation,
-            ),
-            Chomp1d(padding),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-        )
-        self.residual = (
-            nn.Conv1d(in_channels, out_channels, kernel_size=1)
-            if in_channels != out_channels
-            else nn.Identity()
-        )
-        self.out_relu = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.out_relu(self.net(x) + self.residual(x))
-
+        return self.conv(F.pad(x, (self.left_pad, 0)))
 
 
 class MultiScaleTemporalEncoder(nn.Module):
-    """Multi-resolution temporal feature extractor for EEG evolution."""
-    def __init__(self, channels: int, hidden: int, dropout: float):
+    """Causal short/medium/long temporal feature extractor."""
+
+    def __init__(self, channels: int, hidden: int, dropout: float) -> None:
         super().__init__()
         branch = max(hidden // 3, 8)
-        self.short = nn.Conv1d(channels, branch, kernel_size=3, padding=1)
-        self.medium = nn.Conv1d(channels, branch, kernel_size=5, padding=2)
-        self.long = nn.Conv1d(channels, branch, kernel_size=7, padding=3)
+        self.short = CausalConv1d(channels, branch, kernel_size=3)
+        self.medium = CausalConv1d(channels, branch, kernel_size=5)
+        self.long = CausalConv1d(channels, branch, kernel_size=7)
         self.fusion = nn.Sequential(
             nn.Conv1d(branch * 3, hidden, kernel_size=1),
             nn.GELU(),
@@ -222,21 +167,25 @@ class MultiScaleTemporalEncoder(nn.Module):
         )
         self.norm = nn.LayerNorm(hidden)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         a = F.gelu(self.short(x))
         b = F.gelu(self.medium(x))
         c = F.gelu(self.long(x))
         y = self.fusion(torch.cat([a, b, c], dim=1))
         return self.norm(y.transpose(1, 2)).transpose(1, 2)
 
+
 class DynaGATOnsetModel(nn.Module):
     """
-    Real temporal architecture:
-        [B,T,18,F]
-          -> dual-view GATv2 independently for each time window
-          -> [B,T,D]
-          -> causal TCN over T
-          -> one onset logit per window [B,T]
+    Patient-independent causal seizure-onset detector.
+
+    Input [B,T,18,F]
+      -> dual-view GATv2 per EEG window
+      -> causal multi-scale temporal encoder
+      -> causal Transformer refinement
+      -> one onset logit per window [B,T]
+
+    No output at time t can attend to a future EEG window t+1...T.
     """
 
     def __init__(
@@ -255,12 +204,8 @@ class DynaGATOnsetModel(nn.Module):
             heads=heads,
             dropout=dropout,
         )
-        self.tcn = MultiScaleTemporalEncoder(
-            graph_hidden, tcn_hidden, dropout
-        )
+        self.tcn = MultiScaleTemporalEncoder(graph_hidden, tcn_hidden, dropout)
 
-        # Temporal attention refinement: learns seizure evolution across adjacent EEG windows
-        # after graph reasoning. This reduces isolated false alarms.
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=tcn_hidden,
             nhead=4,
@@ -270,8 +215,6 @@ class DynaGATOnsetModel(nn.Module):
             activation="gelu",
             norm_first=True,
         )
-        # Final temporal reasoning block:
-        # learn short-term seizure evolution with trainable positional context.
         self.temporal_pos_embedding = nn.Parameter(torch.zeros(1, 256, tcn_hidden))
         nn.init.normal_(self.temporal_pos_embedding, std=0.02)
 
@@ -293,6 +236,7 @@ class DynaGATOnsetModel(nn.Module):
         x: torch.Tensor,
         dynamic_dst: torch.Tensor,
         dynamic_weight: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
         return_gate: bool = False,
     ):
         if x.ndim != 4:
@@ -301,6 +245,11 @@ class DynaGATOnsetModel(nn.Module):
         batch_size, time_steps, nodes, _ = x.shape
         if nodes != NUM_NODES:
             raise ValueError(f"Expected {NUM_NODES} nodes, got {nodes}")
+        if time_steps > self.temporal_pos_embedding.size(1):
+            raise ValueError(
+                f"Sequence length {time_steps} exceeds positional capacity "
+                f"{self.temporal_pos_embedding.size(1)}"
+            )
 
         graph_count = batch_size * time_steps
         x_graphs = x.reshape(graph_count, NUM_NODES, -1)
@@ -311,13 +260,30 @@ class DynaGATOnsetModel(nn.Module):
         sequence = graph_embedding.view(batch_size, time_steps, -1)
 
         temporal = self.tcn(sequence.transpose(1, 2)).transpose(1, 2)
+        temporal = temporal + self.temporal_pos_embedding[:, :time_steps, :]
 
-        # Add temporal position information before attention.
-        steps = temporal.size(1)
-        if steps <= self.temporal_pos_embedding.size(1):
-            temporal = temporal + self.temporal_pos_embedding[:, :steps, :]
+        causal_mask = torch.triu(
+            torch.ones(
+                (time_steps, time_steps),
+                device=temporal.device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
 
-        temporal = self.temporal_transformer(temporal)
+        key_padding_mask = None
+        if valid_mask is not None:
+            if valid_mask.shape != (batch_size, time_steps):
+                raise ValueError(
+                    f"valid_mask must be {(batch_size, time_steps)}, got {tuple(valid_mask.shape)}"
+                )
+            key_padding_mask = ~valid_mask.to(device=temporal.device, dtype=torch.bool)
+
+        temporal = self.temporal_transformer(
+            temporal,
+            mask=causal_mask,
+            src_key_padding_mask=key_padding_mask,
+        )
         temporal = self.temporal_dropout(temporal)
         temporal = self.temporal_norm(temporal)
         logits = self.classifier(temporal).squeeze(-1)
@@ -327,5 +293,5 @@ class DynaGATOnsetModel(nn.Module):
         return logits
 
 
-# Backward-compatible class name for old imports.
+# Backward-compatible class name for older imports/checkpoints.
 DynaGAT_Onset_Model = DynaGATOnsetModel
