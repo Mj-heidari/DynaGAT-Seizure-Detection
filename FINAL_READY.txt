@@ -1,0 +1,9 @@
+DynaGAT Final Ready
+
+Epochs: 24
+Pipeline: CHB-MIT BIDS -> preprocessing -> temporal graphs -> LOPO training
+Architecture: Dynamic GATv2 + TCN + Temporal Transformer + positional embedding
+
+Run:
+python run_preprocessing.py
+python run_training.py

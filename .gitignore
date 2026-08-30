@@ -1,0 +1,26 @@
+# Raw dataset
+data/
+
+# Generated/cache data
+data_cache_v2/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+Desktop.ini
+# Model checkpoints
+results/*.pt

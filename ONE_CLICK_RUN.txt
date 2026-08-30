@@ -1,0 +1,15 @@
+Final execution:
+
+1. Set CHB-MIT BIDS path in config.py
+
+2. Run:
+
+python run_final_pipeline.py
+
+Automatic flow:
+CHB-MIT BIDS
+ -> preprocessing
+ -> temporal graph cache
+ -> 24 epoch training
+ -> LOPO evaluation
+ -> figures export

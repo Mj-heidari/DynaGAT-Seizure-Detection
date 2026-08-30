@@ -1,0 +1,36 @@
+DynaGAT-FINAL+ Strategy
+
+1. Data:
+- CHB-MIT BIDS dataset
+- Raw EEG recordings processed directly
+- Temporal graph cache generated from EEG windows
+
+2. Evaluation:
+- Patient-independent Leave-One-Patient-Out evaluation
+- Multi-patient validation for threshold selection
+- Test patient never participates in training
+
+3. Final Architecture:
+EEG windows
+ -> Dynamic Graph Learning
+ -> GATv2 spatial attention
+ -> Multi-scale temporal encoder
+ -> Temporal Transformer self-attention
+ -> Calibration and decision pipeline
+ -> Seizure prediction
+
+4. Training:
+- CUDA GPU acceleration
+- 24 epochs
+- Same preprocessing/cache compatibility
+
+5. Evaluation outputs:
+- LOPO patient performance
+- AUROC/AUPRC
+- Event sensitivity
+- False alarms per hour
+- Latency
+- Calibration error
+- Publication figures
+
+This represents the final experimental strategy.
