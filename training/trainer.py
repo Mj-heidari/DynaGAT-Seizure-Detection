@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import random
 import sys
 import time
@@ -20,6 +21,7 @@ if str(PROJECT_DIR) not in sys.path:
 from config import (
     BATCH_SIZE,
     DROPOUT,
+    EARLY_STOPPING_PATIENCE,
     EPOCHS,
     FOCAL_ALPHA,
     FOCAL_GAMMA,
@@ -28,11 +30,15 @@ from config import (
     LEARNING_RATE,
     LINKED_SUBJECT_GROUPS,
     MAX_GRAD_NORM,
+    MIN_EPOCHS_BEFORE_STOPPING,
     PROCESSED_DATA_DIR,
     RANDOM_SEED,
     RESULTS_DIR,
+    SEQUENCE_LENGTH,
     TCN_HIDDEN,
+    VALIDATION_CHECK_INTERVAL,
     WEIGHT_DECAY,
+    WINDOW_STRIDE_SEC,
 )
 from dataset.sequence_dataset import (
     TemporalClipDataset,
@@ -50,6 +56,7 @@ from training.losses import BoundaryAwareFocalLoss
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_VERSION = "causal_v4_features20"
 
 
 class PredictionBundle:
@@ -93,8 +100,9 @@ def subject_groups(subjects: Sequence[str]) -> List[List[str]]:
 
 
 def make_loader(dataset: TemporalClipDataset, shuffle: bool, batch_size: int) -> DataLoader:
-    # num_workers=0 is deliberate on Windows: mmap-backed caches plus worker
-    # spawning can duplicate mappings and RAM usage.
+    # num_workers=0 is deliberate on Windows. mmap-backed multi-GB caches plus
+    # worker spawning can duplicate address spaces; 48 GB RAM helps but does not
+    # make that duplication useful because indexing is already cheap.
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -179,9 +187,6 @@ def _keep_largest_causal_context(
         return probs, labels, recording_ids, window_indices
 
     rid = np.asarray(recording_ids, dtype=str)
-    # Primary key: recording id, secondary: absolute window index, tertiary:
-    # local context position. Keeping the last item therefore keeps the largest
-    # amount of available causal history for each physical EEG window.
     order = np.lexsort((context_positions, window_indices, rid))
     rid_s = rid[order]
     idx_s = window_indices[order]
@@ -268,7 +273,8 @@ def save_prediction_bundle(
     threshold: float,
     test_subjects: Sequence[str],
 ) -> None:
-    """Persist real held-out predictions for reproducible figures and analysis."""
+    """Persist held-out predictions plus metadata for reproducible figures."""
+    metadata_json = json.dumps(bundle.recording_metadata, separators=(",", ":"))
     np.savez_compressed(
         path,
         probs=bundle.probs.astype(np.float32, copy=False),
@@ -277,6 +283,9 @@ def save_prediction_bundle(
         window_indices=bundle.window_indices.astype(np.int64, copy=False),
         threshold=np.asarray(float(threshold), dtype=np.float32),
         test_patient=np.asarray("+".join(test_subjects), dtype=str),
+        model_version=np.asarray(MODEL_VERSION, dtype=str),
+        window_stride_sec=np.asarray(float(WINDOW_STRIDE_SEC), dtype=np.float32),
+        recording_metadata_json=np.asarray(metadata_json, dtype=str),
     )
 
 
@@ -284,24 +293,41 @@ def caches_for_subjects(cache_by_subject: Dict[str, Dict], subjects: Sequence[st
     return [cache_by_subject[s] for s in subjects]
 
 
-def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int = BATCH_SIZE) -> None:
+def _cpu_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+
+def _validation_score(metrics: Dict[str, float]) -> float:
+    auprc = float(metrics.get("auprc", float("nan")))
+    if np.isfinite(auprc):
+        return auprc
+    auroc = float(metrics.get("auroc", float("nan")))
+    return auroc if np.isfinite(auroc) else -float("inf")
+
+
+def run_lopo(
+    max_folds: int | None = None,
+    epochs: int = EPOCHS,
+    batch_size: int = BATCH_SIZE,
+) -> None:
     seed_everything(RANDOM_SEED)
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
         print(f"[*] Device: {torch.cuda.get_device_name(0)}")
+        print(f"[*] CUDA capability: {torch.cuda.get_device_capability(0)}")
     else:
         print("[!] CUDA not detected. The code will run on CPU but will be very slow.")
 
     cache_paths = sorted(PROCESSED_DATA_DIR.glob("*_temporal_graphs.pt"))
     if not cache_paths:
         raise FileNotFoundError(
-            f"No v2 temporal caches found in {PROCESSED_DATA_DIR}.\n"
+            f"No v3 temporal caches found in {PROCESSED_DATA_DIR}.\n"
             "Run: python run_preprocessing.py"
         )
 
-    print(f"[*] Loading {len(cache_paths)} mmap-backed patient caches...")
+    print(f"[*] Loading {len(cache_paths)} mmap-backed v3 patient caches...")
     cache_by_subject: Dict[str, Dict] = {}
     for path in tqdm(cache_paths, desc="load caches", ncols=100):
         cache = load_temporal_cache(path)
@@ -315,7 +341,7 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
 
     validation_size = min(4, len(groups) - 2)
     print(f"[*] LOPO patient groups: {len(groups)}")
-    print("[*] Test patient is never used for training, threshold selection, or normalization.")
+    print("[*] Test patient is never used for training, threshold selection, normalization, or checkpoint selection.")
     print(f"[*] Inner validation groups per fold: {validation_size}\n")
 
     results: List[Dict] = []
@@ -345,6 +371,15 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
 
         mean, std = compute_fold_normalization(train_caches)
         train_ds = TemporalClipDataset(train_caches, mean, std, training=True)
+        # Quick validation is non-overlapping: enough for model selection and much
+        # cheaper than the final context-rich continuous validation pass.
+        val_quick_ds = TemporalClipDataset(
+            val_caches,
+            mean,
+            std,
+            training=False,
+            eval_stride=SEQUENCE_LENGTH,
+        )
         val_ds = TemporalClipDataset(val_caches, mean, std, training=False)
         test_ds = TemporalClipDataset(test_caches, mean, std, training=False)
 
@@ -354,10 +389,11 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
         print(
             f"clips: train={len(train_ds):,} "
             f"(important={len(train_ds.important_refs):,}, negative_pool={len(train_ds.negative_pool):,}) | "
-            f"val={len(val_ds):,} | test={len(test_ds):,}"
+            f"val-fast={len(val_quick_ds):,} | val={len(val_ds):,} | test={len(test_ds):,}"
         )
 
         train_loader = make_loader(train_ds, shuffle=True, batch_size=batch_size)
+        val_quick_loader = make_loader(val_quick_ds, shuffle=False, batch_size=batch_size)
         val_loader = make_loader(val_ds, shuffle=False, batch_size=batch_size)
         test_loader = make_loader(test_ds, shuffle=False, batch_size=batch_size)
 
@@ -378,25 +414,97 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
         scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
 
         fold_start = time.perf_counter()
+        best_state: Dict[str, torch.Tensor] | None = None
+        best_score = -float("inf")
+        best_epoch = 0
+        checks_without_improvement = 0
+        history: List[Dict] = []
+        epochs_ran = 0
+
         for epoch in range(1, epochs + 1):
             epoch_start = time.perf_counter()
             loss = train_epoch(model, train_loader, optimizer, criterion, scaler, epoch, epochs)
             scheduler.step()
             epoch_sec = time.perf_counter() - epoch_start
+            current_lr = float(scheduler.get_last_lr()[0])
+            epochs_ran = epoch
 
-            gpu_mem = ""
+            gpu_mem = float("nan")
             if torch.cuda.is_available():
-                allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)
-                gpu_mem = f" | peakVRAM={allocated:.2f}GB"
+                gpu_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)
                 torch.cuda.reset_peak_memory_stats()
 
-            print(
-                f"epoch {epoch:02d}/{epochs:02d} | loss={loss:.5f} | "
-                f"time={epoch_sec:.1f}s | lr={scheduler.get_last_lr()[0]:.2e}{gpu_mem}"
-            )
+            history_row = {
+                "epoch": epoch,
+                "train_loss": loss,
+                "lr": current_lr,
+                "epoch_sec": epoch_sec,
+                "peak_vram_gb": gpu_mem,
+                "val_auroc": float("nan"),
+                "val_auprc": float("nan"),
+                "is_best": 0,
+            }
 
-        # Validation is evaluated once after training. The held-out test patient is
-        # not touched until normalization, training, and threshold selection finish.
+            should_validate = (
+                epoch % VALIDATION_CHECK_INTERVAL == 0 or epoch == epochs
+            )
+            if should_validate:
+                quick_pred = predict(model, val_quick_loader)
+                quick_metrics = compute_window_metrics(
+                    quick_pred.labels, quick_pred.probs, threshold=0.5
+                )
+                score = _validation_score(quick_metrics)
+                history_row["val_auroc"] = quick_metrics["auroc"]
+                history_row["val_auprc"] = quick_metrics["auprc"]
+
+                improved = score > best_score + 1e-5
+                if improved:
+                    best_score = score
+                    best_epoch = epoch
+                    best_state = _cpu_state_dict(model)
+                    checks_without_improvement = 0
+                    history_row["is_best"] = 1
+                else:
+                    checks_without_improvement += 1
+
+                print(
+                    f"epoch {epoch:02d}/{epochs:02d} | loss={loss:.5f} | "
+                    f"val AUPRC={quick_metrics['auprc']:.4f} | "
+                    f"best={best_score:.4f}@{best_epoch:02d} | "
+                    f"time={epoch_sec:.1f}s | lr={current_lr:.2e}" +
+                    (f" | peakVRAM={gpu_mem:.2f}GB" if np.isfinite(gpu_mem) else "")
+                )
+                del quick_pred
+
+                if (
+                    epoch >= MIN_EPOCHS_BEFORE_STOPPING
+                    and checks_without_improvement >= EARLY_STOPPING_PATIENCE
+                ):
+                    history.append(history_row)
+                    print(
+                        f"[*] Early stopping at epoch {epoch}; restoring best epoch {best_epoch}."
+                    )
+                    break
+            else:
+                print(
+                    f"epoch {epoch:02d}/{epochs:02d} | loss={loss:.5f} | "
+                    f"time={epoch_sec:.1f}s | lr={current_lr:.2e}" +
+                    (f" | peakVRAM={gpu_mem:.2f}GB" if np.isfinite(gpu_mem) else "")
+                )
+
+            history.append(history_row)
+
+        if best_state is None:
+            best_state = _cpu_state_dict(model)
+            best_epoch = epochs_ran
+        model.load_state_dict(best_state)
+        del best_state
+
+        history_path = RESULTS_DIR / f"fold_{fold_idx + 1:02d}_training_history.csv"
+        pd.DataFrame(history).to_csv(history_path, index=False)
+
+        # Full validation is used only after model selection. Event-level threshold
+        # selection remains validation-only; the test patient is still untouched.
         val_pred = predict(model, val_loader)
         threshold = select_event_threshold(
             labels=val_pred.labels,
@@ -446,13 +554,15 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
         checkpoint_path = RESULTS_DIR / f"dynagat_onset_fold_{fold_idx + 1:02d}_{fold_name}.pt"
         torch.save(
             {
-                "model_version": "causal_v3",
+                "model_version": MODEL_VERSION,
                 "model_state_dict": model.state_dict(),
                 "test_subjects": test_subjects,
                 "validation_subjects": val_subjects,
                 "feature_mean": mean,
                 "feature_std": std,
                 "validation_threshold": threshold,
+                "best_epoch": best_epoch,
+                "best_quick_val_auprc": best_score,
             },
             checkpoint_path,
         )
@@ -465,6 +575,9 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
                 "fold": fold_idx + 1,
                 "test_patient": fold_name,
                 "validation_patient": "+".join(val_subjects),
+                "best_epoch": best_epoch,
+                "epochs_ran": epochs_ran,
+                "best_quick_val_auprc": best_score,
                 "threshold": threshold,
                 "val_auroc": val_window["auroc"],
                 "val_auprc": val_window["auprc"],
@@ -492,8 +605,8 @@ def run_lopo(max_folds: int | None = None, epochs: int = EPOCHS, batch_size: int
         out_csv = RESULTS_DIR / "lopo_results_summary.csv"
         pd.DataFrame(results).to_csv(out_csv, index=False)
 
-        del model, optimizer, scheduler, train_loader, val_loader, test_loader
-        del train_ds, val_ds, test_ds, val_pred, test_pred
+        del model, optimizer, scheduler, train_loader, val_quick_loader, val_loader, test_loader
+        del train_ds, val_quick_ds, val_ds, test_ds, val_pred, test_pred
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
