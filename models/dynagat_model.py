@@ -17,9 +17,7 @@ from config import (
 )
 
 
-class DualViewGATv2Encoder(nn.Module):
-    """Static montage GATv2 + functional GATv2 + learned fusion gate."""
-
+class ResidualDualViewGATv2Encoder(nn.Module):
     def __init__(
         self,
         in_channels: int = NODE_FEATURE_DIM,
@@ -36,43 +34,44 @@ class DualViewGATv2Encoder(nn.Module):
         self.num_nodes = NUM_NODES
         self.top_k = TOP_K_DYNAMIC
 
-        self.static_1 = GATv2Conv(
-            in_channels, hidden_dim // heads, heads=heads, dropout=dropout
-        )
-        self.static_2 = GATv2Conv(
-            hidden_dim, out_dim // heads, heads=heads, dropout=dropout
-        )
-        self.static_3 = GATv2Conv(
-            out_dim, out_dim // heads, heads=heads, dropout=dropout
-        )
+        def static_layer(in_dim: int, out_total: int) -> GATv2Conv:
+            return GATv2Conv(in_dim, out_total // heads, heads=heads, dropout=dropout)
 
-        self.dynamic_1 = GATv2Conv(
-            in_channels,
-            hidden_dim // heads,
-            heads=heads,
-            edge_dim=1,
-            dropout=dropout,
-        )
-        self.dynamic_2 = GATv2Conv(
-            hidden_dim,
-            out_dim // heads,
-            heads=heads,
-            edge_dim=1,
-            dropout=dropout,
-        )
-        self.dynamic_3 = GATv2Conv(
-            out_dim,
-            out_dim // heads,
-            heads=heads,
-            edge_dim=1,
-            dropout=dropout,
-        )
+        def dynamic_layer(in_dim: int, out_total: int) -> GATv2Conv:
+            return GATv2Conv(
+                in_dim,
+                out_total // heads,
+                heads=heads,
+                edge_dim=1,
+                dropout=dropout,
+            )
 
-        self.gate = nn.Sequential(
+        self.static_1 = static_layer(in_channels, hidden_dim)
+        self.static_2 = static_layer(hidden_dim, out_dim)
+        self.static_3 = static_layer(out_dim, out_dim)
+        self.dynamic_1 = dynamic_layer(in_channels, hidden_dim)
+        self.dynamic_2 = dynamic_layer(hidden_dim, out_dim)
+        self.dynamic_3 = dynamic_layer(out_dim, out_dim)
+
+        self.static_norm1 = nn.LayerNorm(hidden_dim)
+        self.static_norm2 = nn.LayerNorm(out_dim)
+        self.static_norm3 = nn.LayerNorm(out_dim)
+        self.dynamic_norm1 = nn.LayerNorm(hidden_dim)
+        self.dynamic_norm2 = nn.LayerNorm(out_dim)
+        self.dynamic_norm3 = nn.LayerNorm(out_dim)
+
+        pool_hidden = max(16, out_dim // 2)
+        self.static_pool_score = nn.Sequential(
+            nn.Linear(out_dim, pool_hidden), nn.GELU(), nn.Linear(pool_hidden, 1)
+        )
+        self.dynamic_pool_score = nn.Sequential(
+            nn.Linear(out_dim, pool_hidden), nn.GELU(), nn.Linear(pool_hidden, 1)
+        )
+        self.fusion_gate = nn.Sequential(
             nn.Linear(out_dim * 2, out_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(out_dim, 1),
+            nn.Linear(out_dim, out_dim),
             nn.Sigmoid(),
         )
         self.out_norm = nn.LayerNorm(out_dim)
@@ -98,14 +97,19 @@ class DualViewGATv2Encoder(nn.Module):
         offsets = torch.arange(
             graph_count, device=dynamic_dst.device, dtype=torch.long
         ).view(graph_count, 1) * self.num_nodes
-
         src = self.dynamic_src.to(dynamic_dst.device).view(1, -1).expand(graph_count, -1)
         dst = dynamic_dst.reshape(graph_count, -1)
         src = src + offsets
         dst = dst + offsets
-        edge_index = torch.stack([src.reshape(-1), dst.reshape(-1)], dim=0)
-        edge_attr = dynamic_weight.reshape(-1, 1)
-        return edge_index, edge_attr
+        return (
+            torch.stack([src.reshape(-1), dst.reshape(-1)], dim=0),
+            dynamic_weight.reshape(-1, 1),
+        )
+
+    @staticmethod
+    def _attention_pool(nodes: torch.Tensor, scorer: nn.Module) -> torch.Tensor:
+        weights = torch.softmax(scorer(nodes).squeeze(-1), dim=1).unsqueeze(-1)
+        return torch.sum(nodes * weights, dim=1)
 
     def forward(
         self,
@@ -115,79 +119,68 @@ class DualViewGATv2Encoder(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         graph_count = x.shape[0]
         x_flat = x.reshape(graph_count * self.num_nodes, -1)
-
         static_ei = self._repeat_static_edges(graph_count, x.device)
         dynamic_ei, dynamic_ea = self._build_dynamic_edges(dynamic_dst, dynamic_weight)
 
-        hs = F.elu(self.static_1(x_flat, static_ei))
-        hs = F.dropout(hs, p=self.dropout, training=self.training)
-        hs = self.static_2(hs, static_ei)
-        hs = F.elu(self.static_3(hs, static_ei))
+        hs1 = self.static_norm1(F.elu(self.static_1(x_flat, static_ei)))
+        hs1 = F.dropout(hs1, p=self.dropout, training=self.training)
+        hs2 = self.static_norm2(F.elu(self.static_2(hs1, static_ei)) + hs1)
+        hs2 = F.dropout(hs2, p=self.dropout, training=self.training)
+        hs3 = self.static_norm3(F.elu(self.static_3(hs2, static_ei)) + hs2)
 
-        hd = F.elu(self.dynamic_1(x_flat, dynamic_ei, edge_attr=dynamic_ea))
-        hd = F.dropout(hd, p=self.dropout, training=self.training)
-        hd = self.dynamic_2(hd, dynamic_ei, edge_attr=dynamic_ea)
-        hd = F.elu(self.dynamic_3(hd, dynamic_ei, edge_attr=dynamic_ea))
+        hd1 = self.dynamic_norm1(
+            F.elu(self.dynamic_1(x_flat, dynamic_ei, edge_attr=dynamic_ea))
+        )
+        hd1 = F.dropout(hd1, p=self.dropout, training=self.training)
+        hd2 = self.dynamic_norm2(
+            F.elu(self.dynamic_2(hd1, dynamic_ei, edge_attr=dynamic_ea)) + hd1
+        )
+        hd2 = F.dropout(hd2, p=self.dropout, training=self.training)
+        hd3 = self.dynamic_norm3(
+            F.elu(self.dynamic_3(hd2, dynamic_ei, edge_attr=dynamic_ea)) + hd2
+        )
 
-        gs = hs.view(graph_count, self.num_nodes, -1).mean(dim=1)
-        gd = hd.view(graph_count, self.num_nodes, -1).mean(dim=1)
-
-        gate = self.gate(torch.cat([gs, gd], dim=-1))
+        hs_nodes = hs3.view(graph_count, self.num_nodes, -1)
+        hd_nodes = hd3.view(graph_count, self.num_nodes, -1)
+        gs = self._attention_pool(hs_nodes, self.static_pool_score)
+        gd = self._attention_pool(hd_nodes, self.dynamic_pool_score)
+        gate = self.fusion_gate(torch.cat([gs, gd], dim=-1))
         fused = gate * gs + (1.0 - gate) * gd
-        fused = F.dropout(fused, p=self.dropout, training=self.training)
-        fused = self.out_norm(fused)
-        return fused, gate
+        return self.out_norm(F.dropout(fused, p=self.dropout, training=self.training)), gate
 
 
 class CausalConv1d(nn.Module):
-    """1-D convolution that never reads future time steps."""
-
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int) -> None:
         super().__init__()
         self.left_pad = int(kernel_size) - 1
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=0)
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(F.pad(x, (self.left_pad, 0)))
 
 
-class MultiScaleTemporalEncoder(nn.Module):
-    """Causal short/medium/long temporal feature extractor."""
-
+class ResidualMultiScaleTemporalEncoder(nn.Module):
     def __init__(self, channels: int, hidden: int, dropout: float) -> None:
         super().__init__()
         branch = max(hidden // 3, 8)
         self.short = CausalConv1d(channels, branch, kernel_size=3)
         self.medium = CausalConv1d(channels, branch, kernel_size=5)
         self.long = CausalConv1d(channels, branch, kernel_size=7)
-        self.fusion = nn.Sequential(
-            nn.Conv1d(branch * 3, hidden, kernel_size=1),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+        self.fusion = nn.Conv1d(branch * 3, hidden * 2, kernel_size=1)
+        self.residual = nn.Identity() if channels == hidden else nn.Conv1d(channels, hidden, 1)
+        self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         a = F.gelu(self.short(x))
         b = F.gelu(self.medium(x))
         c = F.gelu(self.long(x))
-        y = self.fusion(torch.cat([a, b, c], dim=1))
+        fused = F.glu(self.fusion(torch.cat([a, b, c], dim=1)), dim=1)
+        y = self.dropout(fused) + self.residual(x)
         return self.norm(y.transpose(1, 2)).transpose(1, 2)
 
 
 class DynaGATOnsetModel(nn.Module):
-    """
-    Patient-independent causal seizure-onset detector.
-
-    Input [B,T,18,F]
-      -> dual-view GATv2 per EEG window
-      -> causal multi-scale temporal encoder
-      -> causal Transformer refinement
-      -> one onset logit per window [B,T]
-
-    No output at time t can attend to a future EEG window t+1...T.
-    """
-
     def __init__(
         self,
         in_channels: int = NODE_FEATURE_DIM,
@@ -197,15 +190,14 @@ class DynaGATOnsetModel(nn.Module):
         dropout: float = DROPOUT,
     ) -> None:
         super().__init__()
-        self.graph_encoder = DualViewGATv2Encoder(
+        self.graph_encoder = ResidualDualViewGATv2Encoder(
             in_channels=in_channels,
             hidden_dim=graph_hidden,
             out_dim=graph_hidden,
             heads=heads,
             dropout=dropout,
         )
-        self.tcn = MultiScaleTemporalEncoder(graph_hidden, tcn_hidden, dropout)
-
+        self.tcn = ResidualMultiScaleTemporalEncoder(graph_hidden, tcn_hidden, dropout)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=tcn_hidden,
             nhead=4,
@@ -217,18 +209,15 @@ class DynaGATOnsetModel(nn.Module):
         )
         self.temporal_pos_embedding = nn.Parameter(torch.zeros(1, 256, tcn_hidden))
         nn.init.normal_(self.temporal_pos_embedding, std=0.02)
-
-        self.temporal_transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=3
-        )
+        self.temporal_transformer = nn.TransformerEncoder(encoder_layer, num_layers=3)
         self.temporal_dropout = nn.Dropout(dropout)
         self.temporal_norm = nn.LayerNorm(tcn_hidden)
-
+        self.head_norm = nn.LayerNorm(tcn_hidden * 2)
         self.classifier = nn.Sequential(
-            nn.Linear(tcn_hidden, 32),
-            nn.ReLU(inplace=True),
+            nn.Linear(tcn_hidden * 2, 64),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(32, 1),
+            nn.Linear(64, 1),
         )
 
     def forward(
@@ -241,36 +230,26 @@ class DynaGATOnsetModel(nn.Module):
     ):
         if x.ndim != 4:
             raise ValueError(f"Expected x [B,T,18,F], got {tuple(x.shape)}")
-
         batch_size, time_steps, nodes, _ = x.shape
         if nodes != NUM_NODES:
             raise ValueError(f"Expected {NUM_NODES} nodes, got {nodes}")
         if time_steps > self.temporal_pos_embedding.size(1):
-            raise ValueError(
-                f"Sequence length {time_steps} exceeds positional capacity "
-                f"{self.temporal_pos_embedding.size(1)}"
-            )
+            raise ValueError("Sequence length exceeds positional embedding capacity")
 
         graph_count = batch_size * time_steps
-        x_graphs = x.reshape(graph_count, NUM_NODES, -1)
-        dst_graphs = dynamic_dst.reshape(graph_count, NUM_NODES, TOP_K_DYNAMIC)
-        weight_graphs = dynamic_weight.reshape(graph_count, NUM_NODES, TOP_K_DYNAMIC)
-
-        graph_embedding, gate = self.graph_encoder(x_graphs, dst_graphs, weight_graphs)
+        graph_embedding, gate = self.graph_encoder(
+            x.reshape(graph_count, NUM_NODES, -1),
+            dynamic_dst.reshape(graph_count, NUM_NODES, TOP_K_DYNAMIC),
+            dynamic_weight.reshape(graph_count, NUM_NODES, TOP_K_DYNAMIC),
+        )
         sequence = graph_embedding.view(batch_size, time_steps, -1)
-
         temporal = self.tcn(sequence.transpose(1, 2)).transpose(1, 2)
         temporal = temporal + self.temporal_pos_embedding[:, :time_steps, :]
 
         causal_mask = torch.triu(
-            torch.ones(
-                (time_steps, time_steps),
-                device=temporal.device,
-                dtype=torch.bool,
-            ),
+            torch.ones((time_steps, time_steps), device=temporal.device, dtype=torch.bool),
             diagonal=1,
         )
-
         key_padding_mask = None
         if valid_mask is not None:
             if valid_mask.shape != (batch_size, time_steps):
@@ -284,14 +263,11 @@ class DynaGATOnsetModel(nn.Module):
             mask=causal_mask,
             src_key_padding_mask=key_padding_mask,
         )
-        temporal = self.temporal_dropout(temporal)
-        temporal = self.temporal_norm(temporal)
-        logits = self.classifier(temporal).squeeze(-1)
-
+        temporal = self.temporal_norm(self.temporal_dropout(temporal))
+        previous = torch.zeros_like(temporal)
+        previous[:, 1:, :] = temporal[:, :-1, :]
+        delta = temporal - previous
+        logits = self.classifier(self.head_norm(torch.cat([temporal, delta], dim=-1))).squeeze(-1)
         if return_gate:
-            return logits, gate.view(batch_size, time_steps)
+            return logits, gate.mean(dim=-1).view(batch_size, time_steps)
         return logits
-
-
-# Backward-compatible class name for older imports/checkpoints.
-DynaGAT_Onset_Model = DynaGATOnsetModel
