@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
-from config import BATCH_SIZE, EPOCHS
-from training.trainer_v5 import run_lopo_v5
+import pandas as pd
+
+from config import BATCH_SIZE, EPOCHS, PROCESSED_DATA_DIR, RESULTS_DIR
+from training.trainer import subject_groups
+from training.trainer_v5 import MODEL_VERSION, run_lopo_v5
 
 
 def parse_folds(spec: str) -> list[int]:
@@ -35,6 +39,48 @@ def parse_folds(spec: str) -> list[int]:
     return sorted(folds)
 
 
+def remaining_folds() -> list[int]:
+    """Return v5 LOPO folds that do not yet have a completed summary row.
+
+    This makes long unattended runs resume-safe at fold granularity. Each fold is
+    written to lopo_results_summary.csv immediately after completion, so rerunning
+    with --remaining skips already completed folds and continues with the rest.
+    """
+    cache_paths = sorted(PROCESSED_DATA_DIR.glob("*_temporal_graphs.pt"))
+    if not cache_paths:
+        raise FileNotFoundError(
+            f"No temporal caches found in {PROCESSED_DATA_DIR}. Run preprocessing first."
+        )
+
+    subjects = [path.name.removesuffix("_temporal_graphs.pt") for path in cache_paths]
+    n_folds = len(subject_groups(sorted(subjects)))
+    all_folds = set(range(1, n_folds + 1))
+
+    summary_path = RESULTS_DIR / "lopo_results_summary.csv"
+    completed: set[int] = set()
+    if summary_path.exists():
+        try:
+            df = pd.read_csv(summary_path)
+            if "fold" in df.columns:
+                if "model_version" in df.columns:
+                    df = df[df["model_version"].astype(str) == MODEL_VERSION]
+                else:
+                    df = df.iloc[0:0]
+                completed = {
+                    int(value)
+                    for value in df["fold"].dropna().tolist()
+                    if 1 <= int(value) <= n_folds
+                }
+        except Exception as exc:
+            print(f"[warn] Could not read existing LOPO summary: {exc}")
+
+    remaining = sorted(all_folds.difference(completed))
+    print(f"[*] Total independent LOPO folds: {n_folds}")
+    print(f"[*] Completed v5 folds: {sorted(completed)}")
+    print(f"[*] Remaining v5 folds: {remaining}")
+    return remaining
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train frozen causal DynaGAT v5 with patient-independent LOPO"
@@ -52,6 +98,11 @@ if __name__ == "__main__":
         default=None,
         metavar="SPEC",
         help="Run explicit 1-based folds, e.g. 2-5 or 2,4,7-9. Existing v5 summary rows are preserved.",
+    )
+    selection.add_argument(
+        "--remaining",
+        action="store_true",
+        help="Run every v5 LOPO fold not already present in lopo_results_summary.csv; safe to rerun after interruption.",
     )
     parser.add_argument(
         "--epochs",
@@ -74,9 +125,16 @@ if __name__ == "__main__":
     if args.max_folds is not None and args.max_folds < 1:
         parser.error("--max-folds must be >= 1")
 
+    folds = args.folds
+    if args.remaining:
+        folds = remaining_folds()
+        if not folds:
+            print("[+] All v5 LOPO folds are already complete. Nothing to run.")
+            raise SystemExit(0)
+
     run_lopo_v5(
         max_folds=args.max_folds,
-        folds=args.folds,
+        folds=folds,
         epochs=args.epochs,
         batch_size=args.batch_size,
     )
