@@ -13,49 +13,104 @@ from sklearn.metrics import (
 )
 
 
-def _load_pooled(prediction_files: Sequence[Path]) -> tuple[np.ndarray, np.ndarray]:
-    probs_parts = []
-    labels_parts = []
-    for path in prediction_files:
-        with np.load(path, allow_pickle=False) as data:
-            probs_parts.append(np.asarray(data["probs"], dtype=np.float64))
-            labels_parts.append(np.asarray(data["labels"], dtype=np.int64))
-    return np.concatenate(labels_parts), np.concatenate(probs_parts)
+def _load_prediction(path: Path) -> tuple[np.ndarray, np.ndarray, str]:
+    with np.load(path, allow_pickle=False) as data:
+        probs = np.asarray(data["probs"], dtype=np.float64)
+        labels = np.asarray(data["labels"], dtype=np.int64)
+        patient = (
+            str(np.asarray(data["test_patient"]).item())
+            if "test_patient" in data.files
+            else path.stem
+        )
+    return labels, probs, patient
 
 
 def plot_roc_pr(prediction_files: Sequence[Path], out: Path) -> None:
-    labels, probs = _load_pooled(prediction_files)
-    if labels.size == 0 or np.unique(labels).size < 2:
+    pooled_labels = []
+    pooled_probs = []
+    folds = []
+
+    for path in prediction_files:
+        labels, probs, patient = _load_prediction(path)
+        if labels.size == 0:
+            continue
+        pooled_labels.append(labels)
+        pooled_probs.append(probs)
+        folds.append((labels, probs, patient))
+
+    if not pooled_labels:
+        print("[skip] ROC/PR: no held-out predictions")
+        return
+
+    labels_all = np.concatenate(pooled_labels)
+    probs_all = np.concatenate(pooled_probs)
+    if np.unique(labels_all).size < 2:
         print("[skip] ROC/PR requires both positive and negative held-out windows")
         return
 
-    fpr, tpr, _ = roc_curve(labels, probs)
-    roc_auc = roc_auc_score(labels, probs)
+    fig, ax = plt.subplots(figsize=(6.2, 5.5))
+    fold_aurocs = []
+    for labels, probs, _patient in folds:
+        if np.unique(labels).size < 2:
+            continue
+        fpr, tpr, _ = roc_curve(labels, probs)
+        fold_aurocs.append(float(roc_auc_score(labels, probs)))
+        ax.plot(fpr, tpr, linewidth=0.8, alpha=0.22)
 
-    fig = plt.figure(figsize=(5.5, 5.0))
-    plt.plot(fpr, tpr, label=f"Pooled LOPO AUROC = {roc_auc:.3f}")
-    plt.plot([0, 1], [0, 1], linestyle="--", label="Chance")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("Held-out Window ROC")
-    plt.legend()
-    plt.tight_layout()
+    fpr, tpr, _ = roc_curve(labels_all, probs_all)
+    pooled_auc = float(roc_auc_score(labels_all, probs_all))
+    ax.plot(fpr, tpr, linewidth=2.2, label=f"Pooled AUROC = {pooled_auc:.3f}")
+    ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.0, label="Chance")
+    if fold_aurocs:
+        ax.text(
+            0.98,
+            0.04,
+            f"Patient AUROC: {np.mean(fold_aurocs):.3f} ± {np.std(fold_aurocs):.3f}",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=9,
+        )
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("Held-out LOPO Window ROC")
+    ax.grid(alpha=0.2)
+    ax.legend(loc="lower right")
+    fig.tight_layout()
     fig.savefig(Path(out) / "Figure2_ROC.pdf", bbox_inches="tight")
     fig.savefig(Path(out) / "Figure2_ROC.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
-    precision, recall, _ = precision_recall_curve(labels, probs)
-    auprc = average_precision_score(labels, probs)
-    prevalence = float(np.mean(labels))
+    fig, ax = plt.subplots(figsize=(6.2, 5.5))
+    fold_auprcs = []
+    for labels, probs, _patient in folds:
+        if np.unique(labels).size < 2:
+            continue
+        precision, recall, _ = precision_recall_curve(labels, probs)
+        fold_auprcs.append(float(average_precision_score(labels, probs)))
+        ax.plot(recall, precision, linewidth=0.8, alpha=0.22)
 
-    fig = plt.figure(figsize=(5.5, 5.0))
-    plt.plot(recall, precision, label=f"Pooled LOPO AUPRC = {auprc:.3f}")
-    plt.axhline(prevalence, linestyle="--", label=f"Prevalence = {prevalence:.4f}")
-    plt.xlabel("Recall")
-    plt.ylabel("Precision")
-    plt.title("Held-out Window Precision-Recall")
-    plt.legend()
-    plt.tight_layout()
+    precision, recall, _ = precision_recall_curve(labels_all, probs_all)
+    pooled_auprc = float(average_precision_score(labels_all, probs_all))
+    prevalence = float(np.mean(labels_all))
+    ax.plot(recall, precision, linewidth=2.2, label=f"Pooled AUPRC = {pooled_auprc:.3f}")
+    ax.axhline(prevalence, linestyle="--", linewidth=1.0, label=f"Prevalence = {prevalence:.4f}")
+    if fold_auprcs:
+        ax.text(
+            0.98,
+            0.96,
+            f"Patient AUPRC: {np.mean(fold_auprcs):.3f} ± {np.std(fold_auprcs):.3f}",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=9,
+        )
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title("Held-out LOPO Precision-Recall")
+    ax.grid(alpha=0.2)
+    ax.legend(loc="best")
+    fig.tight_layout()
     fig.savefig(Path(out) / "Figure2_PR.pdf", bbox_inches="tight")
     fig.savefig(Path(out) / "Figure2_PR.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
