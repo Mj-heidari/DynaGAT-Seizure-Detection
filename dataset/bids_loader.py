@@ -8,6 +8,7 @@ import mne
 import numpy as np
 import pandas as pd
 import torch
+from scipy import signal
 from tqdm import tqdm
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -18,8 +19,14 @@ from config import (
     BANDPASS_HFREQ,
     BANDPASS_LFREQ,
     BIDS_ROOT,
+    CACHE_VERSION,
     CHANNELS_18,
+    DYNAMIC_CORR_WEIGHT,
+    DYNAMIC_WPLI_WEIGHT,
+    FILTER_IIR_ORDER,
+    NODE_FEATURE_DIM,
     NUM_NODES,
+    PREPROCESSING_TAG,
     PREPROCESS_CHUNK_WINDOWS,
     PROCESSED_DATA_DIR,
     SFREQ,
@@ -32,7 +39,6 @@ mne.set_log_level("ERROR")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CANONICAL_CHANNELS = [ch.upper().replace(" ", "") for ch in CHANNELS_18]
-CACHE_VERSION = 2
 
 BANDS = [
     (0.5, 4.0),
@@ -73,7 +79,6 @@ def parse_seizure_events(tsv_path: Path) -> List[Tuple[float, float]]:
         has_seizure_keyword = any(
             key in text for key in ("seiz", "ictal", "sz", "epil")
         )
-
         if has_seizure_keyword or not descriptive_cols:
             intervals.append((onset, onset + duration))
 
@@ -90,10 +95,7 @@ def _normalize_channel_name(name: str) -> str:
 
 
 def _pick_canonical_channels(raw: mne.io.BaseRaw) -> mne.io.BaseRaw | None:
-    """
-    Select the 18 canonical bipolar channels while tolerating common CHB-MIT
-    duplicate suffixes such as T8-P8-0 / T8-P8-1.
-    """
+    """Select the canonical 18 bipolar channels with CHB-MIT suffix tolerance."""
     normalized = {name: _normalize_channel_name(name) for name in raw.ch_names}
     selected: List[str] = []
     rename: Dict[str, str] = {}
@@ -123,29 +125,59 @@ def _pick_canonical_channels(raw: mne.io.BaseRaw) -> mne.io.BaseRaw | None:
     return picked
 
 
+def _causal_bandpass(data_v: np.ndarray, sfreq: float) -> np.ndarray:
+    """Causal Butterworth band-pass with steady-state initialization."""
+    sos = signal.butter(
+        FILTER_IIR_ORDER,
+        [BANDPASS_LFREQ, BANDPASS_HFREQ],
+        btype="bandpass",
+        fs=sfreq,
+        output="sos",
+    )
+    zi_template = signal.sosfilt_zi(sos)
+    filtered = np.empty_like(data_v, dtype=np.float64)
+    for channel in range(data_v.shape[0]):
+        x = np.asarray(data_v[channel], dtype=np.float64)
+        zi = zi_template * float(x[0])
+        filtered[channel], _ = signal.sosfilt(sos, x, zi=zi)
+    return filtered.astype(np.float32, copy=False)
+
+
 def clean_raw(edf_path: Path) -> np.ndarray | None:
-    """Read one EDF, select canonical channels, resample if needed, and filter."""
+    """
+    Read one EDF, select canonical bipolar channels, apply strictly causal
+    filtering, and return microvolt data for numerically stable feature extraction.
+    """
     try:
         raw = mne.io.read_raw_edf(str(edf_path), preload=True, verbose="ERROR")
         picked = _pick_canonical_channels(raw)
         if picked is None:
             available = [_normalize_channel_name(ch) for ch in raw.ch_names]
-            missing = [ch for ch in CANONICAL_CHANNELS if ch not in available]
+            missing = [
+                ch
+                for ch in CANONICAL_CHANNELS
+                if not any(a == ch or a.startswith(ch + "-") for a in available)
+            ]
             print(f"[skip] {edf_path.name}: missing canonical channels {missing}")
             return None
 
         sfreq = float(picked.info["sfreq"])
-        if not np.isclose(sfreq, SFREQ):
-            print(f"[info] {edf_path.name}: resampling {sfreq:g} Hz -> {SFREQ:g} Hz")
-            picked.resample(SFREQ, npad="auto", verbose="ERROR")
+        if not np.isclose(sfreq, SFREQ, rtol=0.0, atol=1e-6):
+            # Native CHB-MIT is 256 Hz. Silent resampling would introduce another
+            # temporal operator and can compromise strict causal interpretation.
+            print(
+                f"[skip] {edf_path.name}: unexpected sfreq={sfreq:g} Hz; "
+                f"expected native CHB-MIT {SFREQ:g} Hz"
+            )
+            return None
 
-        picked.filter(
-            l_freq=BANDPASS_LFREQ,
-            h_freq=BANDPASS_HFREQ,
-            method="iir",
-            verbose="ERROR",
-        )
-        return picked.get_data().astype(np.float32, copy=False)
+        data_v = picked.get_data().astype(np.float32, copy=False)
+        filtered_v = _causal_bandpass(data_v, sfreq)
+        data_uv = filtered_v * 1e6
+        if not np.isfinite(data_uv).all():
+            print(f"[skip] {edf_path.name}: non-finite samples after filtering")
+            return None
+        return np.ascontiguousarray(data_uv, dtype=np.float32)
     except Exception as exc:
         print(f"[skip] {edf_path.name}: {exc}")
         return None
@@ -175,59 +207,89 @@ def _make_labels(
 
 
 @torch.inference_mode()
-def _extract_feature_chunk(wins: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Parameters
-    ----------
-    wins : [B, 18, 512] float32 on GPU/CPU
-
-    Returns
-    -------
-    node_features : [B, 18, 16] float32
-    dynamic_dst   : [B, 18, K] int64
-    dynamic_weight: [B, 18, K] float32
-    """
+def _extract_feature_chunk(
+    wins: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extract 20 node features and a hybrid dynamic connectivity graph."""
     _, channels, win_len = wins.shape
-    assert channels == NUM_NODES
+    if channels != NUM_NODES:
+        raise ValueError(f"Expected {NUM_NODES} channels, got {channels}")
 
-    # 1) Relative FFT band power: 5 features/node
-    power = torch.abs(torch.fft.rfft(wins, dim=-1)).square()
+    # ------------------------------------------------------------------
+    # Spectral representation with a Hann taper.
+    # ------------------------------------------------------------------
+    taper = torch.hann_window(
+        win_len, periodic=False, device=wins.device, dtype=wins.dtype
+    ).view(1, 1, -1)
+    spectrum_r = torch.fft.rfft(wins * taper, dim=-1)
+    power = spectrum_r.abs().square()
     freqs = torch.fft.rfftfreq(win_len, d=1.0 / SFREQ).to(wins.device)
-    total_mask = (freqs >= 0.5) & (freqs <= 45.0)
-    total_power = power[..., total_mask].sum(dim=-1, keepdim=True).clamp_min(1e-10)
+    total_mask = (freqs >= BANDPASS_LFREQ) & (freqs <= BANDPASS_HFREQ)
+    total_freqs = freqs[total_mask]
+    total_band_power = power[..., total_mask].clamp_min(1e-12)
+    total_power = total_band_power.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
-    bp_features = []
+    # 1) Five log relative band powers.
+    bp_features: List[torch.Tensor] = []
     for low, high in BANDS:
-        band_mask = (freqs >= low) & (freqs < high)
-        bp = power[..., band_mask].sum(dim=-1, keepdim=True) / total_power
-        bp_features.append(torch.log1p(bp))
+        mask = (freqs >= low) & (freqs < high)
+        relative = power[..., mask].sum(dim=-1, keepdim=True) / total_power
+        bp_features.append(relative.clamp_min(1e-8).log())
     bandpower = torch.cat(bp_features, dim=-1)
 
-    # 2) Hjorth + time-domain: 6 features/node
+    # 2) Six Hjorth / time-domain features. Data are in microvolts, avoiding the
+    # near-zero fp16 collapse that occurs when these are computed in volts.
     d1 = torch.diff(wins, dim=-1)
     d2 = torch.diff(d1, dim=-1)
-    var0 = torch.var(wins, dim=-1, keepdim=True, unbiased=False).clamp_min(1e-10)
-    var1 = torch.var(d1, dim=-1, keepdim=True, unbiased=False).clamp_min(1e-10)
-    var2 = torch.var(d2, dim=-1, keepdim=True, unbiased=False).clamp_min(1e-10)
+    var0 = torch.var(wins, dim=-1, keepdim=True, unbiased=False).clamp_min(1e-8)
+    var1 = torch.var(d1, dim=-1, keepdim=True, unbiased=False).clamp_min(1e-8)
+    var2 = torch.var(d2, dim=-1, keepdim=True, unbiased=False).clamp_min(1e-8)
 
-    activity = torch.log1p(var0)
+    activity = var0.log()
     mobility = torch.sqrt(var1 / var0)
-    complexity = torch.sqrt(var2 / var1) / mobility.clamp_min(1e-10)
-    line_length = torch.mean(torch.abs(d1), dim=-1, keepdim=True)
-    rms = torch.sqrt(torch.mean(wins.square(), dim=-1, keepdim=True))
+    complexity = torch.sqrt(var2 / var1) / mobility.clamp_min(1e-8)
+    line_length = torch.log1p(torch.mean(torch.abs(d1), dim=-1, keepdim=True))
+    rms = torch.log1p(torch.sqrt(torch.mean(wins.square(), dim=-1, keepdim=True)))
     zero_cross = (
-        torch.diff(torch.sign(wins), dim=-1).ne(0).sum(dim=-1, keepdim=True).float()
-        / float(win_len)
+        torch.diff(torch.signbit(wins), dim=-1)
+        .ne(0)
+        .sum(dim=-1, keepdim=True)
+        .float()
+        / float(max(1, win_len - 1))
     )
-    hjorth_time = torch.cat(
+    time_features = torch.cat(
         [activity, mobility, complexity, line_length, rms, zero_cross], dim=-1
     )
 
-    # 3) Log-covariance summaries: 5 features/node
+    # 3) Four spectral-shape statistics.
+    spectral_prob = total_band_power / total_power
+    spectral_entropy = -(
+        spectral_prob * spectral_prob.clamp_min(1e-12).log()
+    ).sum(dim=-1, keepdim=True) / np.log(max(2, spectral_prob.shape[-1]))
+    centroid = (
+        spectral_prob * total_freqs.view(1, 1, -1)
+    ).sum(dim=-1, keepdim=True) / BANDPASS_HFREQ
+    cdf = spectral_prob.cumsum(dim=-1)
+    edge_idx = (cdf >= 0.90).to(torch.int64).argmax(dim=-1)
+    spectral_edge = (
+        total_freqs[edge_idx].unsqueeze(-1) / BANDPASS_HFREQ
+    )
+    flatness = (
+        total_band_power.log().mean(dim=-1, keepdim=True).exp()
+        / total_band_power.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+    )
+    spectral_shape = torch.cat(
+        [spectral_entropy, centroid, spectral_edge, flatness], dim=-1
+    )
+
+    # ------------------------------------------------------------------
+    # Covariance-domain summaries and correlation connectivity.
+    # ------------------------------------------------------------------
     centered = wins - wins.mean(dim=-1, keepdim=True)
     cov = torch.bmm(centered, centered.transpose(1, 2)) / float(max(1, win_len - 1))
+    diag_mean = torch.diagonal(cov, dim1=1, dim2=2).mean(dim=-1).clamp_min(1e-6)
     eye = torch.eye(channels, device=wins.device, dtype=wins.dtype).unsqueeze(0)
-    cov = cov + 1e-5 * eye
+    cov = cov + eye * (diag_mean * 1e-4).view(-1, 1, 1)
 
     eigvals, eigvecs = torch.linalg.eigh(cov)
     log_eigvals = eigvals.clamp_min(1e-6).log()
@@ -239,16 +301,34 @@ def _extract_feature_chunk(wins: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     diag = torch.diagonal(log_cov, dim1=1, dim2=2).unsqueeze(-1)
     mean_conn = log_cov.mean(dim=-1, keepdim=True)
     std_conn = log_cov.std(dim=-1, keepdim=True, unbiased=False)
-
-    large = torch.eye(channels, device=wins.device, dtype=wins.dtype).unsqueeze(0) * 1e5
+    large = eye * 1e5
     max_conn = (log_cov - large).max(dim=-1, keepdim=True).values
     min_conn = (log_cov + large).min(dim=-1, keepdim=True).values
-    riemann = torch.cat([diag, mean_conn, std_conn, max_conn, min_conn], dim=-1)
+    covariance_features = torch.cat(
+        [diag, mean_conn, std_conn, max_conn, min_conn], dim=-1
+    )
 
-    node_features = torch.cat([bandpower, hjorth_time, riemann], dim=-1)
-    node_features = torch.nan_to_num(node_features, nan=0.0, posinf=0.0, neginf=0.0)
+    node_features = torch.cat(
+        [bandpower, time_features, spectral_shape, covariance_features], dim=-1
+    )
+    if node_features.shape[-1] != NODE_FEATURE_DIM:
+        raise RuntimeError(
+            f"Feature schema produced {node_features.shape[-1]} dims; "
+            f"expected {NODE_FEATURE_DIM}"
+        )
+    node_features = torch.nan_to_num(
+        node_features, nan=0.0, posinf=20.0, neginf=-20.0
+    ).clamp(-30.0, 30.0)
 
-    # 4) wPLI: |E[Im(Sxy)]| / E[|Im(Sxy)|]
+    std0 = centered.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-6)
+    z = centered / std0
+    corr = torch.bmm(z, z.transpose(1, 2)) / float(win_len)
+    abs_corr = corr.abs().clamp(0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # wPLI: |E[Im(Sxy)]| / E[|Im(Sxy)|]. The final edge score is a robust
+    # wPLI-dominant hybrid with absolute correlation.
+    # ------------------------------------------------------------------
     spectrum = torch.fft.fft(wins, dim=-1)
     hilbert_filter = torch.zeros(win_len, dtype=wins.dtype, device=wins.device)
     hilbert_filter[0] = 1.0
@@ -261,29 +341,34 @@ def _extract_feature_chunk(wins: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     analytic = torch.fft.ifft(spectrum * hilbert_filter, dim=-1)
     re = analytic.real
     im = analytic.imag
-
     imag_cross = (
         im.unsqueeze(2) * re.unsqueeze(1)
         - re.unsqueeze(2) * im.unsqueeze(1)
     )
     numerator = imag_cross.mean(dim=-1).abs()
-    denominator = imag_cross.abs().mean(dim=-1).clamp_min(1e-10)
+    denominator = imag_cross.abs().mean(dim=-1).clamp_min(1e-8)
     wpli = (numerator / denominator).clamp(0.0, 1.0)
 
+    functional = (
+        DYNAMIC_WPLI_WEIGHT * wpli
+        + DYNAMIC_CORR_WEIGHT * abs_corr
+    ).clamp(0.0, 1.0)
     diagonal = torch.arange(channels, device=wins.device)
-    wpli[:, diagonal, diagonal] = 0.0
+    functional[:, diagonal, diagonal] = 0.0
 
     dynamic_weight, dynamic_dst = torch.topk(
-        wpli, k=TOP_K_DYNAMIC, dim=-1, largest=True, sorted=True
+        functional, k=TOP_K_DYNAMIC, dim=-1, largest=True, sorted=True
     )
-
     return node_features, dynamic_dst, dynamic_weight
 
 
 @torch.inference_mode()
-def extract_recording(raw_data: np.ndarray, seizure_intervals: Sequence[Tuple[float, float]]) -> Dict:
+def extract_recording(
+    raw_data_uv: np.ndarray,
+    seizure_intervals: Sequence[Tuple[float, float]],
+) -> Dict:
     """Extract compact graph tensors for every 1-second-stride window in one EDF."""
-    channels, total_samples = raw_data.shape
+    channels, total_samples = raw_data_uv.shape
     win_len = int(round(WINDOW_SEC * SFREQ))
     stride = int(round(WINDOW_STRIDE_SEC * SFREQ))
 
@@ -296,20 +381,20 @@ def extract_recording(raw_data: np.ndarray, seizure_intervals: Sequence[Tuple[fl
 
     shape = (n_windows, channels, win_len)
     strides = (
-        raw_data.strides[1] * stride,
-        raw_data.strides[0],
-        raw_data.strides[1],
+        raw_data_uv.strides[1] * stride,
+        raw_data_uv.strides[0],
+        raw_data_uv.strides[1],
     )
     window_view = np.lib.stride_tricks.as_strided(
-        raw_data, shape=shape, strides=strides, writeable=False
+        raw_data_uv, shape=shape, strides=strides, writeable=False
     )
 
     x_parts: List[torch.Tensor] = []
     dst_parts: List[torch.Tensor] = []
     weight_parts: List[torch.Tensor] = []
 
-    feature_sum = torch.zeros(16, dtype=torch.float64)
-    feature_sumsq = torch.zeros(16, dtype=torch.float64)
+    feature_sum = torch.zeros(NODE_FEATURE_DIM, dtype=torch.float64)
+    feature_sumsq = torch.zeros(NODE_FEATURE_DIM, dtype=torch.float64)
     feature_count = 0
 
     for start in range(0, n_windows, PREPROCESS_CHUNK_WINDOWS):
@@ -319,11 +404,12 @@ def extract_recording(raw_data: np.ndarray, seizure_intervals: Sequence[Tuple[fl
 
         features, dynamic_dst, dynamic_weight = _extract_feature_chunk(wins)
         features_cpu = features.cpu()
-
         feature_sum += features_cpu.sum(dim=(0, 1), dtype=torch.float64)
         feature_sumsq += features_cpu.double().square().sum(dim=(0, 1))
         feature_count += int(features_cpu.shape[0] * features_cpu.shape[1])
 
+        # Compact caches are important because continuous CHB-MIT contains millions
+        # of graph windows. fp16 is safe after the v3 feature rescaling/clamping.
         x_parts.append(features_cpu.to(torch.float16))
         dst_parts.append(dynamic_dst.cpu().to(torch.uint8))
         weight_parts.append(dynamic_weight.cpu().to(torch.float16))
@@ -331,7 +417,6 @@ def extract_recording(raw_data: np.ndarray, seizure_intervals: Sequence[Tuple[fl
         del wins, features, dynamic_dst, dynamic_weight, features_cpu
 
     labels, boundary_weights = _make_labels(n_windows, seizure_intervals)
-
     return {
         "x": torch.cat(x_parts, dim=0),
         "dynamic_dst": torch.cat(dst_parts, dim=0),
@@ -341,14 +426,18 @@ def extract_recording(raw_data: np.ndarray, seizure_intervals: Sequence[Tuple[fl
         "n_windows": int(n_windows),
         "duration_sec": float(total_samples / SFREQ),
         "seizure_intervals": [(float(a), float(b)) for a, b in seizure_intervals],
+        "positive_windows": int(labels.sum().item()),
         "feature_sum": feature_sum,
         "feature_sumsq": feature_sumsq,
         "feature_count": int(feature_count),
     }
 
 
-def build_all_subject_caches(overwrite: bool = False, max_subjects: int | None = None) -> None:
-    """Build continuous compact temporal caches for every BIDS subject."""
+def build_all_subject_caches(
+    overwrite: bool = False,
+    max_subjects: int | None = None,
+) -> None:
+    """Build new v3 continuous caches directly from raw CHB-MIT BIDS EDF files."""
     if not BIDS_ROOT.exists():
         raise FileNotFoundError(
             f"BIDS root does not exist: {BIDS_ROOT}\n"
@@ -364,13 +453,19 @@ def build_all_subject_caches(overwrite: bool = False, max_subjects: int | None =
     if max_subjects is not None:
         subject_dirs = subject_dirs[:max_subjects]
 
-    print(f"[*] Building continuous temporal caches on {DEVICE} for {len(subject_dirs)} subjects")
-    print(f"[*] Output: {PROCESSED_DATA_DIR}\n")
+    print(f"[*] Preprocessing tag : {PREPROCESSING_TAG}")
+    print(f"[*] Cache version     : {CACHE_VERSION}")
+    print(f"[*] Feature dimension : {NODE_FEATURE_DIM}")
+    print(f"[*] Device            : {DEVICE}")
+    print(f"[*] Subjects          : {len(subject_dirs)}")
+    print(f"[*] Output            : {PROCESSED_DATA_DIR}\n")
+
+    manifest_rows: List[Dict] = []
 
     for sub_dir in subject_dirs:
         cache_path = PROCESSED_DATA_DIR / f"{sub_dir.name}_temporal_graphs.pt"
         if cache_path.exists() and not overwrite:
-            print(f"[skip] {sub_dir.name}: cache already exists")
+            print(f"[skip] {sub_dir.name}: v3 cache already exists")
             continue
 
         edf_files = sorted(sub_dir.rglob("*.edf"))
@@ -379,11 +474,13 @@ def build_all_subject_caches(overwrite: bool = False, max_subjects: int | None =
             continue
 
         recordings: List[Dict] = []
-        subject_sum = torch.zeros(16, dtype=torch.float64)
-        subject_sumsq = torch.zeros(16, dtype=torch.float64)
+        subject_sum = torch.zeros(NODE_FEATURE_DIM, dtype=torch.float64)
+        subject_sumsq = torch.zeros(NODE_FEATURE_DIM, dtype=torch.float64)
         subject_count = 0
         total_windows = 0
+        positive_windows = 0
         total_seizures = 0
+        skipped_recordings = 0
 
         pbar = tqdm(edf_files, desc=f"{sub_dir.name}", ncols=100)
         for edf_path in pbar:
@@ -391,11 +488,13 @@ def build_all_subject_caches(overwrite: bool = False, max_subjects: int | None =
             intervals = parse_seizure_events(tsv_path)
             raw_data = clean_raw(edf_path)
             if raw_data is None:
+                skipped_recordings += 1
                 continue
 
             try:
                 rec = extract_recording(raw_data, intervals)
             except Exception as exc:
+                skipped_recordings += 1
                 print(f"[skip] {edf_path.name}: extraction failed: {exc}")
                 continue
 
@@ -407,6 +506,7 @@ def build_all_subject_caches(overwrite: bool = False, max_subjects: int | None =
             subject_sumsq += rec["feature_sumsq"]
             subject_count += rec["feature_count"]
             total_windows += rec["n_windows"]
+            positive_windows += rec["positive_windows"]
             total_seizures += len(intervals)
 
             del raw_data
@@ -421,19 +521,49 @@ def build_all_subject_caches(overwrite: bool = False, max_subjects: int | None =
 
         payload = {
             "cache_version": CACHE_VERSION,
+            "preprocessing_tag": PREPROCESSING_TAG,
+            "node_feature_dim": NODE_FEATURE_DIM,
             "subject": sub_dir.name,
             "recordings": recordings,
             "feature_sum": subject_sum,
             "feature_sumsq": subject_sumsq,
             "feature_count": int(subject_count),
             "total_windows": int(total_windows),
+            "positive_windows": int(positive_windows),
             "total_seizures": int(total_seizures),
+            "valid_recordings": int(len(recordings)),
+            "skipped_recordings": int(skipped_recordings),
+            "sampling_rate_hz": float(SFREQ),
+            "signal_unit": "microvolt",
         }
         torch.save(payload, cache_path)
-        print(
-            f"[+] {sub_dir.name}: {len(recordings)} recordings | "
-            f"{total_windows:,} windows | {total_seizures} seizures -> {cache_path.name}"
+
+        duration_hours = sum(float(r["duration_sec"]) for r in recordings) / 3600.0
+        manifest_rows.append(
+            {
+                "subject": sub_dir.name,
+                "edf_files": len(edf_files),
+                "valid_recordings": len(recordings),
+                "skipped_recordings": skipped_recordings,
+                "windows": total_windows,
+                "positive_windows": positive_windows,
+                "positive_fraction": positive_windows / max(1, total_windows),
+                "seizures": total_seizures,
+                "recording_hours": duration_hours,
+                "cache_version": CACHE_VERSION,
+                "feature_dim": NODE_FEATURE_DIM,
+            }
         )
+        print(
+            f"[+] {sub_dir.name}: {len(recordings)}/{len(edf_files)} recordings | "
+            f"{total_windows:,} windows | {positive_windows:,} positive | "
+            f"{total_seizures} seizures -> {cache_path.name}"
+        )
+
+    if manifest_rows:
+        manifest_path = PROCESSED_DATA_DIR / "preprocessing_manifest.csv"
+        pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
+        print(f"\n[+] Preprocessing manifest: {manifest_path}")
 
 
 if __name__ == "__main__":
