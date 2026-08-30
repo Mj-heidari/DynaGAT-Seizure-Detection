@@ -72,8 +72,10 @@ def get_static_edge_tensor() -> torch.Tensor:
 # Temporal model / training defaults
 # -----------------------------------------------------------------------------
 SEQUENCE_LENGTH = 16               # 16 x 1-second strides ~= 17 s temporal span
-TRAIN_SEQUENCE_STRIDE = 16         # non-overlapping base clips for speed
-EVAL_SEQUENCE_STRIDE = 16          # exact one-pass continuous evaluation
+TRAIN_SEQUENCE_STRIDE = 16         # non-overlapping base clips for training speed
+# Evaluation overlaps clips. Duplicate windows are resolved by keeping the
+# prediction with the largest amount of causal past context.
+EVAL_SEQUENCE_STRIDE = 8
 
 GRAPH_HIDDEN = 96
 GAT_HEADS = 4
@@ -96,8 +98,11 @@ RANDOM_SEED = 42
 FOCAL_ALPHA = 0.75
 FOCAL_GAMMA = 2.0
 
-# Persistence filter used for event-level onset decisions.
+# Event-level alarm policy. These values are applied identically on validation
+# (threshold selection) and on the held-out test patient.
 MIN_CONSECUTIVE_POSITIVE_WINDOWS = 3
+ALARM_REFRACTORY_SEC = 30.0
+EVENT_THRESHOLD_MAX_CANDIDATES = 81
 
 # Preprocessing batch size. Reduce to 64 if GPU preprocessing runs out of VRAM.
 PREPROCESS_CHUNK_WINDOWS = 128
