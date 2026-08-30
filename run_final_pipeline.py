@@ -20,8 +20,8 @@ def run_step(name: str, command: list[str]) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "DynaGAT v3 end-to-end pipeline: raw CHB-MIT preprocessing -> "
-            "causal LOPO training -> publication figures"
+            "DynaGAT end-to-end pipeline: v3 raw CHB-MIT preprocessing -> "
+            "causal v5 LOPO training -> publication figures"
         )
     )
     parser.add_argument(
@@ -80,7 +80,7 @@ def main() -> None:
         if value is not None and value < 1:
             parser.error(f"--{name.replace('_', '-')} must be >= 1")
 
-    print("DynaGAT causal v3 research pipeline")
+    print("DynaGAT causal research pipeline | preprocessing v3 | model v5")
     print(f"Project : {PROJECT_ROOT}")
     print(f"Python  : {sys.executable}")
 
@@ -102,7 +102,7 @@ def main() -> None:
             command += ["--epochs", str(args.epochs)]
         if args.batch_size is not None:
             command += ["--batch-size", str(args.batch_size)]
-        run_step("STEP 2/3 - CAUSAL LOPO TRAINING", command)
+        run_step("STEP 2/3 - CAUSAL DYNAGAT V5 LOPO TRAINING", command)
     else:
         print("\n[skip] training")
 
