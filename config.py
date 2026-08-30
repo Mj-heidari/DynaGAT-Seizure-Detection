@@ -97,8 +97,8 @@ GAT_HEADS = 4
 TCN_HIDDEN = 96
 DROPOUT = 0.25
 
-# RTX 3060 12 GB: 32 clips is still conservative for this graph/temporal model
-# while improving throughput over 24. Override from the CLI if desired.
+# Conservative default for RTX 3060-class GPUs; CLI can override this. Actual
+# peak allocation is logged every epoch so throughput can be tuned empirically.
 BATCH_SIZE = 32
 EPOCHS = 30
 LEARNING_RATE = 8e-4
@@ -120,13 +120,17 @@ RANDOM_SEED = 42
 FOCAL_ALPHA = 0.75
 FOCAL_GAMMA = 2.0
 
-# Event-level alarm policy. Applied identically on validation and held-out test.
-MIN_CONSECUTIVE_POSITIVE_WINDOWS = 3
+# Event-level alarm policy. The operating point is selected on validation only:
+# threshold and persistence are searched jointly, subject to an explicit FAR cap.
+# The selected pair is then frozen and applied unchanged to the held-out patient.
+MIN_CONSECUTIVE_POSITIVE_WINDOWS = 3  # backward-compatible fallback/default
+EVENT_PERSISTENCE_CANDIDATES = (1, 2, 3)
+VALIDATION_FA_PER_HOUR_CAP = 0.5
 ALARM_REFRACTORY_SEC = 30.0
 EVENT_THRESHOLD_MAX_CANDIDATES = 81
 
-# RTX 3060 preprocessing. The largest temporary tensor is the pairwise phase
-# interaction tensor; 256 windows remains comfortably below 12 GB VRAM.
+# Chunked preprocessing keeps the pairwise phase-interaction tensor bounded on
+# RTX 3060-class GPUs while preserving identical numerical results across chunks.
 PREPROCESS_CHUNK_WINDOWS = 256
 
 # Known CHB-MIT identity linkage. PhysioNet notes that chb21 and chb01 are the
