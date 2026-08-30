@@ -1,17 +1,53 @@
+from __future__ import annotations
 
-import pandas as pd
-import matplotlib.pyplot as plt
 from pathlib import Path
 
-def plot_lopo_heatmap(csv_file, out):
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+def plot_lopo_heatmap(csv_file: Path, out: Path) -> None:
     df = pd.read_csv(csv_file)
-    numeric = df.select_dtypes("number")
-    plt.figure(figsize=(10,6))
-    plt.imshow(numeric.T, aspect="auto")
-    plt.yticks(range(len(numeric.columns)), numeric.columns)
-    plt.xticks(range(len(df)), df.iloc[:,0], rotation=45)
-    plt.colorbar(label="value")
-    plt.title("LOPO Patient-Level Performance")
+    if df.empty:
+        print("[skip] LOPO heatmap: summary is empty")
+        return
+
+    preferred = [
+        "auroc",
+        "auprc",
+        "f1",
+        "event_sensitivity",
+        "event_precision",
+        "event_f1",
+        "ece",
+    ]
+    metrics = [name for name in preferred if name in df.columns]
+    if not metrics:
+        print("[skip] LOPO heatmap: no supported numeric metrics")
+        return
+
+    values = df[metrics].to_numpy(dtype=float).T
+    labels = (
+        df["test_patient"].astype(str).tolist()
+        if "test_patient" in df.columns
+        else [str(i + 1) for i in range(len(df))]
+    )
+
+    fig = plt.figure(figsize=(max(9, len(df) * 0.42), 5.5))
+    image = plt.imshow(values, aspect="auto", vmin=0.0, vmax=1.0)
+    plt.yticks(range(len(metrics)), metrics)
+    plt.xticks(range(len(labels)), labels, rotation=60, ha="right")
+    plt.colorbar(image, label="Metric value")
+    plt.title("LOPO Held-out Patient Performance")
+
+    for row in range(values.shape[0]):
+        for col in range(values.shape[1]):
+            value = values[row, col]
+            if np.isfinite(value):
+                plt.text(col, row, f"{value:.2f}", ha="center", va="center", fontsize=7)
+
     plt.tight_layout()
-    plt.savefig(Path(out)/"Figure1_LOPO_heatmap.pdf", bbox_inches="tight")
-    plt.close()
+    fig.savefig(Path(out) / "Figure1_LOPO_heatmap.pdf", bbox_inches="tight")
+    fig.savefig(Path(out) / "Figure1_LOPO_heatmap.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
