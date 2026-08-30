@@ -22,5 +22,8 @@ env/
 # Windows
 Thumbs.db
 Desktop.ini
-# Model checkpoints
+
+# Generated model/evaluation artifacts
 results/*.pt
+results/*.npz
+paper_figures/
