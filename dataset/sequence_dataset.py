@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -12,6 +12,7 @@ from config import (
     EVAL_SEQUENCE_STRIDE,
     MIN_NEGATIVE_CLIPS_PER_EPOCH,
     NEGATIVE_TO_IMPORTANT_RATIO,
+    NODE_FEATURE_DIM,
     NUM_NODES,
     RANDOM_SEED,
     SEQUENCE_LENGTH,
@@ -29,7 +30,7 @@ class ClipRef:
 
 
 def load_temporal_cache(path: Path) -> Dict:
-    """Load a v2 cache using memory mapping when supported by PyTorch."""
+    """Load and minimally validate a v2 temporal cache."""
     kwargs = dict(map_location="cpu", weights_only=False)
     try:
         cache = torch.load(path, mmap=True, **kwargs)
@@ -38,8 +39,16 @@ def load_temporal_cache(path: Path) -> Dict:
 
     if int(cache.get("cache_version", -1)) != 2:
         raise RuntimeError(
-            f"{path.name} is not a v2 temporal cache. Rebuild it with dataset/bids_loader.py"
+            f"{path.name} is not a v2 temporal cache. Rebuild it with run_preprocessing.py"
         )
+
+    required = {"subject", "recordings", "feature_sum", "feature_sumsq", "feature_count"}
+    missing = sorted(required.difference(cache))
+    if missing:
+        raise RuntimeError(f"{path.name} is missing cache fields: {missing}")
+    if int(cache.get("feature_count", 0)) <= 0 or not cache.get("recordings"):
+        raise RuntimeError(f"{path.name} contains no valid recording features")
+
     return cache
 
 
@@ -48,8 +57,8 @@ def compute_fold_normalization(caches: Sequence[Dict]) -> Tuple[torch.Tensor, to
     if not caches:
         raise ValueError("No training caches supplied")
 
-    total_sum = torch.zeros(16, dtype=torch.float64)
-    total_sumsq = torch.zeros(16, dtype=torch.float64)
+    total_sum = torch.zeros(NODE_FEATURE_DIM, dtype=torch.float64)
+    total_sumsq = torch.zeros(NODE_FEATURE_DIM, dtype=torch.float64)
     total_count = 0
 
     for cache in caches:
@@ -68,15 +77,16 @@ def compute_fold_normalization(caches: Sequence[Dict]) -> Tuple[torch.Tensor, to
 
 class TemporalClipDataset(Dataset):
     """
-    Produces real, ordered temporal clips:
-        x: [T, 18, 16]
+    Produces ordered temporal clips:
+        x: [T, 18, F]
         dynamic_dst: [T, 18, K]
         dynamic_weight: [T, 18, K]
         labels: [T]
 
-    Training mode dynamically resamples negative clips each epoch. Evaluation mode
-    covers every cached window exactly once (apart from padded positions in the final
-    clip of a recording).
+    Training dynamically resamples negative clips each epoch. Evaluation uses
+    overlapping full-length clips where possible. The trainer later keeps one
+    prediction per physical EEG window: the occurrence with the largest amount
+    of available causal past context.
     """
 
     def __init__(
@@ -103,6 +113,11 @@ class TemporalClipDataset(Dataset):
         self.min_negative_clips = int(min_negative_clips)
         self.seed = int(seed)
 
+        if self.sequence_length < 1:
+            raise ValueError("sequence_length must be >= 1")
+        if self.train_stride < 1 or self.eval_stride < 1:
+            raise ValueError("sequence strides must be >= 1")
+
         self.important_refs: List[ClipRef] = []
         self.negative_pool: List[ClipRef] = []
         self.eval_refs: List[ClipRef] = []
@@ -123,14 +138,23 @@ class TemporalClipDataset(Dataset):
         }
 
     @staticmethod
-    def _starts_covering_all(n: int, length: int, stride: int) -> List[int]:
+    def _evaluation_starts(n: int, length: int, stride: int) -> List[int]:
+        """Cover a recording with overlap while preferring full-length tail context."""
         if n <= 0:
             return []
-        starts = list(range(0, n, stride))
+        if n <= length:
+            return [0]
+
+        final_start = n - length
+        starts = list(range(0, final_start + 1, stride))
+        if starts[-1] != final_start:
+            starts.append(final_start)
         return starts
 
     @staticmethod
     def _training_starts(n: int, length: int, stride: int) -> List[int]:
+        if n <= 0:
+            return []
         if n < length:
             return [0]
         starts = list(range(0, n - length + 1, stride))
@@ -148,30 +172,48 @@ class TemporalClipDataset(Dataset):
                 bweights = rec["boundary_weights"].float()
 
                 if self.training:
-                    starts = set(self._training_starts(n, self.sequence_length, self.train_stride))
+                    starts = set(
+                        self._training_starts(n, self.sequence_length, self.train_stride)
+                    )
 
-                    # Explicitly include onset-centered clips so the model repeatedly
-                    # sees the transition boundary even when it falls near a base clip edge.
+                    # Explicit onset-centered clips improve exposure to transition
+                    # boundaries without using any held-out patient information.
                     if n > 0:
                         prev = torch.zeros_like(labels)
                         prev[1:] = labels[:-1]
-                        onset_indices = torch.nonzero(labels & ~prev, as_tuple=False).flatten().tolist()
+                        onset_indices = torch.nonzero(
+                            labels & ~prev, as_tuple=False
+                        ).flatten().tolist()
                         for onset_idx in onset_indices:
-                            centered = max(0, min(n - self.sequence_length, onset_idx - self.sequence_length // 2))
+                            centered = max(
+                                0,
+                                min(
+                                    n - self.sequence_length,
+                                    onset_idx - self.sequence_length // 2,
+                                ),
+                            )
                             starts.add(int(max(0, centered)))
 
                     for start in sorted(starts):
                         valid_len = min(self.sequence_length, n - start)
+                        if valid_len <= 0:
+                            continue
                         end = start + valid_len
-                        important = bool(labels[start:end].any() or (bweights[start:end] > 1.0).any())
+                        important = bool(
+                            labels[start:end].any() or (bweights[start:end] > 1.0).any()
+                        )
                         ref = ClipRef(cache_idx, recording_idx, int(start), int(valid_len))
                         if important:
                             self.important_refs.append(ref)
                         else:
                             self.negative_pool.append(ref)
                 else:
-                    for start in self._starts_covering_all(n, self.sequence_length, self.eval_stride):
+                    for start in self._evaluation_starts(
+                        n, self.sequence_length, self.eval_stride
+                    ):
                         valid_len = min(self.sequence_length, n - start)
+                        if valid_len <= 0:
+                            continue
                         self.eval_refs.append(
                             ClipRef(cache_idx, recording_idx, int(start), int(valid_len))
                         )
@@ -205,7 +247,7 @@ class TemporalClipDataset(Dataset):
         end = start + ref.valid_len
         t = self.sequence_length
 
-        x = torch.zeros((t, NUM_NODES, 16), dtype=torch.float32)
+        x = torch.zeros((t, NUM_NODES, NODE_FEATURE_DIM), dtype=torch.float32)
         dynamic_dst = torch.zeros((t, NUM_NODES, TOP_K_DYNAMIC), dtype=torch.long)
         dynamic_weight = torch.zeros((t, NUM_NODES, TOP_K_DYNAMIC), dtype=torch.float32)
         labels = torch.zeros(t, dtype=torch.float32)
@@ -222,8 +264,8 @@ class TemporalClipDataset(Dataset):
         valid_mask[: ref.valid_len] = True
         window_idx[: ref.valid_len] = torch.arange(start, end, dtype=torch.long)
 
-        # Harmless self destinations for padded positions. They are masked from loss
-        # and metrics; causal TCN ensures end padding cannot alter earlier outputs.
+        # Padded positions are masked from loss/metrics/attention. Self destinations
+        # keep their graph indices valid if a very short recording requires padding.
         if ref.valid_len < t:
             self_nodes = torch.arange(NUM_NODES).view(NUM_NODES, 1).repeat(1, TOP_K_DYNAMIC)
             dynamic_dst[ref.valid_len :] = self_nodes.unsqueeze(0)
