@@ -1,9 +1,0 @@
-DynaGAT Final Candidate update
-
-Changes:
-- Epochs increased to 24.
-- Temporal Transformer upgraded from 2 to 3 layers.
-- Added trainable temporal positional embeddings.
-- Added temporal dropout after attention.
-- Kept CHB-MIT BIDS preprocessing and cache compatibility.
-- Kept LOPO evaluation pipeline.
