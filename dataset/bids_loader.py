@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import sys
-import warnings
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import mne
 import numpy as np
@@ -29,7 +28,6 @@ from config import (
     WINDOW_STRIDE_SEC,
 )
 
-warnings.filterwarnings("ignore")
 mne.set_log_level("ERROR")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -52,7 +50,8 @@ def parse_seizure_events(tsv_path: Path) -> List[Tuple[float, float]]:
 
     try:
         df = pd.read_csv(tsv_path, sep="\t")
-    except Exception:
+    except Exception as exc:
+        print(f"[warn] could not parse {tsv_path.name}: {exc}")
         return []
 
     descriptive_cols = [
@@ -75,37 +74,78 @@ def parse_seizure_events(tsv_path: Path) -> List[Tuple[float, float]]:
             key in text for key in ("seiz", "ictal", "sz", "epil")
         )
 
-        # If there are no descriptive columns, onset/duration rows are assumed
-        # to represent seizure annotations. Otherwise require a seizure keyword.
         if has_seizure_keyword or not descriptive_cols:
             intervals.append((onset, onset + duration))
 
     return sorted(intervals)
 
 
+def _normalize_channel_name(name: str) -> str:
+    return (
+        name.upper()
+        .replace("EEG ", "")
+        .replace("-REF", "")
+        .replace(" ", "")
+    )
+
+
+def _pick_canonical_channels(raw: mne.io.BaseRaw) -> mne.io.BaseRaw | None:
+    """
+    Select the 18 canonical bipolar channels while tolerating common CHB-MIT
+    duplicate suffixes such as T8-P8-0 / T8-P8-1.
+    """
+    normalized = {name: _normalize_channel_name(name) for name in raw.ch_names}
+    selected: List[str] = []
+    rename: Dict[str, str] = {}
+    missing: List[str] = []
+
+    for canonical in CANONICAL_CHANNELS:
+        exact = [name for name, norm in normalized.items() if norm == canonical]
+        aliases = [
+            name
+            for name, norm in normalized.items()
+            if norm.startswith(canonical + "-")
+            and norm[len(canonical) + 1 :].isdigit()
+        ]
+        candidates = exact if exact else aliases
+        if not candidates:
+            missing.append(canonical)
+            continue
+        chosen = candidates[0]
+        selected.append(chosen)
+        rename[chosen] = canonical
+
+    if missing:
+        return None
+
+    picked = raw.copy().pick(selected)
+    picked.rename_channels(rename)
+    return picked
+
+
 def clean_raw(edf_path: Path) -> np.ndarray | None:
-    """Read one EDF, select the canonical 18 bipolar channels, and filter it."""
+    """Read one EDF, select canonical channels, resample if needed, and filter."""
     try:
         raw = mne.io.read_raw_edf(str(edf_path), preload=True, verbose="ERROR")
-        rename_dict = {
-            ch: ch.upper().replace("EEG ", "").replace("-REF", "").replace(" ", "")
-            for ch in raw.ch_names
-        }
-        raw.rename_channels(rename_dict)
-
-        if not all(ch in raw.ch_names for ch in CANONICAL_CHANNELS):
-            missing = [ch for ch in CANONICAL_CHANNELS if ch not in raw.ch_names]
-            print(f"[skip] {edf_path.name}: missing channels {missing}")
+        picked = _pick_canonical_channels(raw)
+        if picked is None:
+            available = [_normalize_channel_name(ch) for ch in raw.ch_names]
+            missing = [ch for ch in CANONICAL_CHANNELS if ch not in available]
+            print(f"[skip] {edf_path.name}: missing canonical channels {missing}")
             return None
 
-        raw.pick(CANONICAL_CHANNELS)
-        raw.filter(
+        sfreq = float(picked.info["sfreq"])
+        if not np.isclose(sfreq, SFREQ):
+            print(f"[info] {edf_path.name}: resampling {sfreq:g} Hz -> {SFREQ:g} Hz")
+            picked.resample(SFREQ, npad="auto", verbose="ERROR")
+
+        picked.filter(
             l_freq=BANDPASS_LFREQ,
             h_freq=BANDPASS_HFREQ,
             method="iir",
             verbose="ERROR",
         )
-        return raw.get_data().astype(np.float32, copy=False)
+        return picked.get_data().astype(np.float32, copy=False)
     except Exception as exc:
         print(f"[skip] {edf_path.name}: {exc}")
         return None
@@ -147,12 +187,10 @@ def _extract_feature_chunk(wins: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     dynamic_dst   : [B, 18, K] int64
     dynamic_weight: [B, 18, K] float32
     """
-    batch_size, channels, win_len = wins.shape
+    _, channels, win_len = wins.shape
     assert channels == NUM_NODES
 
-    # ------------------------------------------------------------------
     # 1) Relative FFT band power: 5 features/node
-    # ------------------------------------------------------------------
     power = torch.abs(torch.fft.rfft(wins, dim=-1)).square()
     freqs = torch.fft.rfftfreq(win_len, d=1.0 / SFREQ).to(wins.device)
     total_mask = (freqs >= 0.5) & (freqs <= 45.0)
@@ -165,9 +203,7 @@ def _extract_feature_chunk(wins: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
         bp_features.append(torch.log1p(bp))
     bandpower = torch.cat(bp_features, dim=-1)
 
-    # ------------------------------------------------------------------
     # 2) Hjorth + time-domain: 6 features/node
-    # ------------------------------------------------------------------
     d1 = torch.diff(wins, dim=-1)
     d2 = torch.diff(d1, dim=-1)
     var0 = torch.var(wins, dim=-1, keepdim=True, unbiased=False).clamp_min(1e-10)
@@ -187,9 +223,7 @@ def _extract_feature_chunk(wins: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
         [activity, mobility, complexity, line_length, rms, zero_cross], dim=-1
     )
 
-    # ------------------------------------------------------------------
     # 3) Log-covariance summaries: 5 features/node
-    # ------------------------------------------------------------------
     centered = wins - wins.mean(dim=-1, keepdim=True)
     cov = torch.bmm(centered, centered.transpose(1, 2)) / float(max(1, win_len - 1))
     eye = torch.eye(channels, device=wins.device, dtype=wins.dtype).unsqueeze(0)
@@ -214,9 +248,7 @@ def _extract_feature_chunk(wins: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     node_features = torch.cat([bandpower, hjorth_time, riemann], dim=-1)
     node_features = torch.nan_to_num(node_features, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # ------------------------------------------------------------------
-    # 4) Correct wPLI: |E[Im(Sxy)]| / E[|Im(Sxy)|]
-    # ------------------------------------------------------------------
+    # 4) wPLI: |E[Im(Sxy)]| / E[|Im(Sxy)|]
     spectrum = torch.fft.fft(wins, dim=-1)
     hilbert_filter = torch.zeros(win_len, dtype=wins.dtype, device=wins.device)
     hilbert_filter[0] = 1.0
@@ -230,7 +262,6 @@ def _extract_feature_chunk(wins: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     re = analytic.real
     im = analytic.imag
 
-    # [B, C, C, T]. Chunking in the caller keeps this memory bounded.
     imag_cross = (
         im.unsqueeze(2) * re.unsqueeze(1)
         - re.unsqueeze(2) * im.unsqueeze(1)
@@ -283,7 +314,6 @@ def extract_recording(raw_data: np.ndarray, seizure_intervals: Sequence[Tuple[fl
 
     for start in range(0, n_windows, PREPROCESS_CHUNK_WINDOWS):
         end = min(n_windows, start + PREPROCESS_CHUNK_WINDOWS)
-        # A contiguous copy prevents unsafe/non-contiguous NumPy stride behavior.
         chunk_np = np.ascontiguousarray(window_view[start:end])
         wins = torch.from_numpy(chunk_np).to(DEVICE, dtype=torch.float32)
 
@@ -294,7 +324,6 @@ def extract_recording(raw_data: np.ndarray, seizure_intervals: Sequence[Tuple[fl
         feature_sumsq += features_cpu.double().square().sum(dim=(0, 1))
         feature_count += int(features_cpu.shape[0] * features_cpu.shape[1])
 
-        # Compact on-disk representation.
         x_parts.append(features_cpu.to(torch.float16))
         dst_parts.append(dynamic_dst.cpu().to(torch.uint8))
         weight_parts.append(dynamic_weight.cpu().to(torch.float16))
@@ -304,10 +333,10 @@ def extract_recording(raw_data: np.ndarray, seizure_intervals: Sequence[Tuple[fl
     labels, boundary_weights = _make_labels(n_windows, seizure_intervals)
 
     return {
-        "x": torch.cat(x_parts, dim=0),                      # [N,18,16] fp16
-        "dynamic_dst": torch.cat(dst_parts, dim=0),          # [N,18,K] uint8
-        "dynamic_weight": torch.cat(weight_parts, dim=0),    # [N,18,K] fp16
-        "labels": labels.to(torch.uint8),                    # [N]
+        "x": torch.cat(x_parts, dim=0),
+        "dynamic_dst": torch.cat(dst_parts, dim=0),
+        "dynamic_weight": torch.cat(weight_parts, dim=0),
+        "labels": labels.to(torch.uint8),
         "boundary_weights": boundary_weights.to(torch.float16),
         "n_windows": int(n_windows),
         "duration_sec": float(total_samples / SFREQ),
@@ -319,12 +348,7 @@ def extract_recording(raw_data: np.ndarray, seizure_intervals: Sequence[Tuple[fl
 
 
 def build_all_subject_caches(overwrite: bool = False, max_subjects: int | None = None) -> None:
-    """
-    Build continuous compact caches for every BIDS subject.
-
-    IMPORTANT: these are new v2 temporal caches. The old sparse *_graphs.pt files
-    are intentionally ignored and left untouched.
-    """
+    """Build continuous compact temporal caches for every BIDS subject."""
     if not BIDS_ROOT.exists():
         raise FileNotFoundError(
             f"BIDS root does not exist: {BIDS_ROOT}\n"
@@ -350,6 +374,10 @@ def build_all_subject_caches(overwrite: bool = False, max_subjects: int | None =
             continue
 
         edf_files = sorted(sub_dir.rglob("*.edf"))
+        if not edf_files:
+            print(f"[skip] {sub_dir.name}: no EDF files found")
+            continue
+
         recordings: List[Dict] = []
         subject_sum = torch.zeros(16, dtype=torch.float64)
         subject_sumsq = torch.zeros(16, dtype=torch.float64)
@@ -384,6 +412,12 @@ def build_all_subject_caches(overwrite: bool = False, max_subjects: int | None =
             del raw_data
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        if not recordings or subject_count <= 0:
+            print(f"[error] {sub_dir.name}: no valid recordings; cache not written")
+            if overwrite and cache_path.exists():
+                cache_path.unlink()
+            continue
 
         payload = {
             "cache_version": CACHE_VERSION,
