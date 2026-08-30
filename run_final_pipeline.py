@@ -20,14 +20,14 @@ def run_step(name: str, command: list[str]) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "DynaGAT end-to-end pipeline: preprocessing -> causal LOPO training "
-            "-> real publication figures"
+            "DynaGAT v3 end-to-end pipeline: raw CHB-MIT preprocessing -> "
+            "causal LOPO training -> publication figures"
         )
     )
     parser.add_argument(
         "--skip-preprocessing",
         action="store_true",
-        help="Use existing data_cache_v2 caches",
+        help="Use existing validated data_cache_v3 caches",
     )
     parser.add_argument(
         "--skip-training",
@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--overwrite-cache",
         action="store_true",
-        help="Rebuild existing subject caches during preprocessing",
+        help="Rebuild existing v3 subject caches from raw EEG",
     )
     parser.add_argument(
         "--max-subjects",
@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--epochs",
         type=int,
         default=None,
-        help="Override epochs per fold from config.py",
+        help="Override maximum epochs per fold from config.py",
     )
     parser.add_argument(
         "--batch-size",
@@ -80,7 +80,7 @@ def main() -> None:
         if value is not None and value < 1:
             parser.error(f"--{name.replace('_', '-')} must be >= 1")
 
-    print("DynaGAT causal research pipeline")
+    print("DynaGAT causal v3 research pipeline")
     print(f"Project : {PROJECT_ROOT}")
     print(f"Python  : {sys.executable}")
 
@@ -90,9 +90,9 @@ def main() -> None:
             command.append("--overwrite")
         if args.max_subjects is not None:
             command += ["--max-subjects", str(args.max_subjects)]
-        run_step("STEP 1/3 - PREPROCESSING", command)
+        run_step("STEP 1/3 - RAW EEG PREPROCESSING V3", command)
     else:
-        print("\n[skip] preprocessing")
+        print("\n[skip] preprocessing (using validated data_cache_v3)")
 
     if not args.skip_training:
         command = [sys.executable, "run_training.py"]
