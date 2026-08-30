@@ -40,6 +40,7 @@ def main() -> None:
     parser.add_argument("--preprocess", action="store_true")
     parser.add_argument("--overwrite-cache", action="store_true")
     parser.add_argument("--skip-training", action="store_true")
+    parser.add_argument("--skip-healthcheck", action="store_true")
     parser.add_argument("--allow-partial-export", action="store_true")
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
@@ -55,6 +56,9 @@ def main() -> None:
             if args.overwrite_cache:
                 command.append("--overwrite")
             run_step("PREPROCESSING", command, log)
+
+        if not args.skip_healthcheck:
+            run_step("HEALTH CHECK", [sys.executable, "-u", "run_healthcheck.py"], log)
 
         if not args.skip_training:
             run_step(
