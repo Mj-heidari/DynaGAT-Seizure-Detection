@@ -27,5 +27,5 @@ Desktop.ini
 # Generated model/evaluation artifacts
 results/*.pt
 results/*.npz
-results/fold_*_training_history.csv
+results/*.csv
 paper_figures/
