@@ -40,6 +40,11 @@ def main() -> None:
     parser.add_argument("--preprocess", action="store_true")
     parser.add_argument("--overwrite-cache", action="store_true")
     parser.add_argument("--skip-training", action="store_true")
+    parser.add_argument(
+        "--force-retrain",
+        action="store_true",
+        help="Retrain every fold even when compatible completed results exist",
+    )
     parser.add_argument("--skip-healthcheck", action="store_true")
     parser.add_argument("--allow-partial-export", action="store_true")
     parser.add_argument("--epochs", type=int, default=EPOCHS)
@@ -48,6 +53,10 @@ def main() -> None:
 
     if args.epochs < 1 or args.batch_size < 1:
         parser.error("epochs and batch size must be >= 1")
+    if args.overwrite_cache and not args.preprocess:
+        parser.error("--overwrite-cache requires --preprocess")
+    if args.force_retrain and args.skip_training:
+        parser.error("--force-retrain cannot be combined with --skip-training")
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as log:
@@ -61,18 +70,24 @@ def main() -> None:
             run_step("HEALTH CHECK", [sys.executable, "-u", "run_healthcheck.py"], log)
 
         if not args.skip_training:
-            run_step(
-                "REMAINING LOPO TRAINING",
+            training_command = [
+                sys.executable,
+                "-u",
+                "run_training.py",
+            ]
+            if not args.force_retrain:
+                training_command.append("--remaining")
+            training_command.extend(
                 [
-                    sys.executable,
-                    "-u",
-                    "run_training.py",
-                    "--remaining",
                     "--epochs",
                     str(args.epochs),
                     "--batch-size",
                     str(args.batch_size),
-                ],
+                ]
+            )
+            run_step(
+                "FULL LOPO RETRAINING" if args.force_retrain else "REMAINING LOPO TRAINING",
+                training_command,
                 log,
             )
 

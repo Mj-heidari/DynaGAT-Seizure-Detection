@@ -296,7 +296,7 @@ def _build_subject(sub_dir: Path) -> Dict | None:
         "sampling_rate_hz": float(bl.SFREQ),
         "signal_unit": "microvolt",
     }
-    torch.save(payload, cache_path)
+    bl._atomic_torch_save(payload, cache_path)
 
     duration_hours = sum(float(r["duration_sec"]) for r in recordings) / 3600.0
     row = {
@@ -355,7 +355,7 @@ def rebuild_selected_subjects(
 
     order = sorted(range(len(manifest)), key=lambda i: _subject_sort_key(str(manifest.iloc[i]["subject"])))
     manifest = manifest.iloc[order].reset_index(drop=True)
-    manifest.to_csv(manifest_path, index=False)
+    bl._atomic_dataframe_csv(manifest, manifest_path)
     print(f"\n[+] Preprocessing manifest updated: {manifest_path}")
 
     total_edf = int(manifest["edf_files"].sum())

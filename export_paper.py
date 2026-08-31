@@ -10,15 +10,23 @@ from pathlib import Path
 import pandas as pd
 
 from config import (
+    CACHE_VERSION,
     PAPER_FIGURES_DIR,
     PAPER_RESULTS_DIR,
     PAPER_TABLES_DIR,
     PROCESSED_DATA_DIR,
+    PREPROCESSING_TAG,
     RESULTS_DIR,
 )
 from DynaGAT_visualization.paper_statistics import generate_paper_statistics
 from DynaGAT_visualization.publication import generate_publication_figures
 from training.runtime import subject_groups
+from training.trainer import (
+    EVALUATION_VERSION,
+    MODEL_VERSION,
+    RESULTS_SCHEMA_VERSION,
+    experiment_signature,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -64,11 +72,75 @@ def main(require_complete: bool = True) -> None:
 
     df = pd.read_csv(summary)
     expected = _expected_folds()
-    completed = len(set(df["fold"].dropna().astype(int))) if "fold" in df.columns else 0
-    if require_complete and completed < expected:
+    required_columns = {
+        "fold",
+        "model_version",
+        "evaluation_version",
+        "results_schema_version",
+        "cache_version",
+        "preprocessing_tag",
+        "experiment_signature",
+        "max_epochs",
+        "batch_size",
+    }
+    missing_columns = sorted(required_columns.difference(df.columns))
+    if missing_columns:
+        raise RuntimeError(
+            "LOPO summary uses a legacy/incomplete schema; rerun training. "
+            f"Missing columns: {missing_columns}"
+        )
+
+    epochs_values = df["max_epochs"].dropna().astype(int).unique().tolist()
+    batch_values = df["batch_size"].dropna().astype(int).unique().tolist()
+    if len(epochs_values) != 1 or len(batch_values) != 1:
+        raise RuntimeError(
+            "LOPO summary mixes incompatible training settings: "
+            f"max_epochs={epochs_values}, batch_size={batch_values}"
+        )
+    signature = experiment_signature(epochs_values[0], batch_values[0])
+    compatible = df[
+        (df["model_version"].astype(str) == MODEL_VERSION)
+        & (df["evaluation_version"].astype(str) == EVALUATION_VERSION)
+        & (df["results_schema_version"].astype(int) == RESULTS_SCHEMA_VERSION)
+        & (df["cache_version"].astype(int) == CACHE_VERSION)
+        & (df["preprocessing_tag"].astype(str) == PREPROCESSING_TAG)
+        & (df["experiment_signature"].astype(str) == signature)
+    ].copy()
+    completed_folds = set(compatible["fold"].dropna().astype(int))
+    expected_folds = set(range(1, expected + 1))
+    missing_folds = sorted(expected_folds.difference(completed_folds))
+    extra_folds = sorted(completed_folds.difference(expected_folds))
+    completed = len(completed_folds.intersection(expected_folds))
+    if require_complete and (missing_folds or extra_folds):
         raise RuntimeError(
             f"LOPO is incomplete: {completed}/{expected} folds. "
+            f"Missing={missing_folds}, extra={extra_folds}. "
             "Run `python run_training.py --remaining` first."
+        )
+    if compatible.empty:
+        raise RuntimeError(
+            "No result rows match the current code/configuration signature; rerun training."
+        )
+    if len(compatible) != len(df):
+        raise RuntimeError(
+            "The summary mixes current and stale experiment rows. Rerun the selected folds "
+            "so lopo_results_summary.csv contains one compatible experiment."
+        )
+
+    missing_artifacts = []
+    for fold in sorted(completed_folds):
+        required_paths = [
+            RESULTS_DIR / f"fold_{fold:02d}_training_history.csv",
+            RESULTS_DIR / f"fold_{fold:02d}_validation_alarm_frontier.csv",
+            RESULTS_DIR / f"fold_{fold:02d}_test_predictions.npz",
+        ]
+        missing_artifacts.extend(str(path) for path in required_paths if not path.exists())
+        if not list(RESULTS_DIR.glob(f"dynagat_fold_{fold:02d}_*.pt")):
+            missing_artifacts.append(str(RESULTS_DIR / f"dynagat_fold_{fold:02d}_<patient>.pt"))
+    if missing_artifacts:
+        raise RuntimeError(
+            "Completed fold rows are missing required artifacts:\n- "
+            + "\n- ".join(missing_artifacts)
         )
 
     generate_paper_statistics(

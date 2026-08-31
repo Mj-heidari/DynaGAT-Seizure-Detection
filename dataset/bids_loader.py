@@ -54,6 +54,19 @@ EXPECTED_CHBMIT_EDF_FILES = 664
 EXPECTED_CHBMIT_SEIZURES = 198
 
 
+def _atomic_torch_save(payload: Dict, path: Path) -> None:
+    """Write a cache beside its destination and atomically replace on success."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def _atomic_dataframe_csv(frame: pd.DataFrame, path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    frame.to_csv(temporary, index=False)
+    temporary.replace(path)
+
+
 def _events_path_for_edf(edf_path: Path) -> Path:
     """Resolve the standard BIDS events.tsv sibling for an EEG EDF file."""
     if edf_path.name.endswith("_eeg.edf"):
@@ -441,6 +454,60 @@ def extract_recording(
     }
 
 
+def _manifest_row_from_cache(
+    cache_path: Path,
+    subject: str,
+    edf_files: Sequence[Path],
+) -> Dict:
+    """Reconstruct a manifest row from an existing validated cache.
+
+    This keeps a non-overwrite preprocessing run idempotent: existing subjects
+    remain in the manifest instead of disappearing when only a missing cache is
+    built during the same invocation.
+    """
+    kwargs = dict(map_location="cpu", weights_only=False)
+    try:
+        cache = torch.load(cache_path, mmap=True, **kwargs)
+    except (TypeError, RuntimeError):
+        cache = torch.load(cache_path, **kwargs)
+
+    if int(cache.get("cache_version", -1)) != CACHE_VERSION:
+        raise RuntimeError(
+            f"{cache_path.name} has an incompatible cache version; rebuild with --overwrite"
+        )
+    if str(cache.get("preprocessing_tag", "")) != PREPROCESSING_TAG:
+        raise RuntimeError(
+            f"{cache_path.name} has an incompatible preprocessing tag; rebuild with --overwrite"
+        )
+    if int(cache.get("node_feature_dim", -1)) != NODE_FEATURE_DIM:
+        raise RuntimeError(
+            f"{cache_path.name} has an incompatible feature dimension; rebuild with --overwrite"
+        )
+    recordings = cache.get("recordings", [])
+    if not recordings:
+        raise RuntimeError(f"{cache_path.name} contains no recordings")
+
+    recording_hours = sum(float(rec.get("duration_sec", 0.0)) for rec in recordings) / 3600.0
+    total_windows = int(cache.get("total_windows", sum(int(rec.get("n_windows", 0)) for rec in recordings)))
+    positive_windows = int(
+        cache.get("positive_windows", sum(int(rec.get("positive_windows", 0)) for rec in recordings))
+    )
+    return {
+        "subject": str(subject),
+        "edf_files": int(len(edf_files)),
+        "event_files_found": int(cache.get("event_files_found", 0)),
+        "valid_recordings": int(cache.get("valid_recordings", len(recordings))),
+        "skipped_recordings": int(cache.get("skipped_recordings", max(0, len(edf_files) - len(recordings)))),
+        "windows": total_windows,
+        "positive_windows": positive_windows,
+        "positive_fraction": positive_windows / max(1, total_windows),
+        "seizures": int(cache.get("total_seizures", 0)),
+        "recording_hours": float(recording_hours),
+        "cache_version": CACHE_VERSION,
+        "feature_dim": NODE_FEATURE_DIM,
+    }
+
+
 def build_all_subject_caches(
     overwrite: bool = False,
     max_subjects: int | None = None,
@@ -472,13 +539,16 @@ def build_all_subject_caches(
 
     for sub_dir in subject_dirs:
         cache_path = PROCESSED_DATA_DIR / f"{sub_dir.name}_temporal_graphs.pt"
-        if cache_path.exists() and not overwrite:
-            print(f"[skip] {sub_dir.name}: v3 cache already exists")
-            continue
-
         edf_files = sorted(sub_dir.rglob("*.edf"))
         if not edf_files:
             print(f"[skip] {sub_dir.name}: no EDF files found")
+            continue
+
+        if cache_path.exists() and not overwrite:
+            manifest_rows.append(
+                _manifest_row_from_cache(cache_path, sub_dir.name, edf_files)
+            )
+            print(f"[skip] {sub_dir.name}: validated v3 cache already exists")
             continue
 
         recordings: List[Dict] = []
@@ -545,7 +615,7 @@ def build_all_subject_caches(
             "sampling_rate_hz": float(SFREQ),
             "signal_unit": "microvolt",
         }
-        torch.save(payload, cache_path)
+        _atomic_torch_save(payload, cache_path)
 
         duration_hours = sum(float(r["duration_sec"]) for r in recordings) / 3600.0
         manifest_rows.append(
@@ -571,9 +641,14 @@ def build_all_subject_caches(
         )
 
     if manifest_rows:
-        manifest_path = PROCESSED_DATA_DIR / "preprocessing_manifest.csv"
+        manifest_name = (
+            "preprocessing_manifest_smoke.csv"
+            if max_subjects is not None
+            else "preprocessing_manifest.csv"
+        )
+        manifest_path = PROCESSED_DATA_DIR / manifest_name
         manifest = pd.DataFrame(manifest_rows)
-        manifest.to_csv(manifest_path, index=False)
+        _atomic_dataframe_csv(manifest, manifest_path)
         print(f"\n[+] Preprocessing manifest: {manifest_path}")
 
         total_edf = int(manifest["edf_files"].sum())

@@ -6,7 +6,13 @@ import pandas as pd
 
 from config import BATCH_SIZE, EPOCHS, PROCESSED_DATA_DIR, RESULTS_DIR
 from training.runtime import subject_groups
-from training.trainer import MODEL_VERSION, run_lopo
+from training.trainer import (
+    EVALUATION_VERSION,
+    MODEL_VERSION,
+    RESULTS_SCHEMA_VERSION,
+    experiment_signature,
+    run_lopo,
+)
 
 
 def parse_folds(spec: str) -> list[int]:
@@ -37,7 +43,7 @@ def parse_folds(spec: str) -> list[int]:
     return sorted(folds)
 
 
-def remaining_folds() -> list[int]:
+def remaining_folds(epochs: int, batch_size: int) -> list[int]:
     cache_paths = sorted(PROCESSED_DATA_DIR.glob("*_temporal_graphs.pt"))
     if not cache_paths:
         raise FileNotFoundError(f"No temporal caches found in {PROCESSED_DATA_DIR}")
@@ -46,12 +52,25 @@ def remaining_folds() -> list[int]:
     all_folds = set(range(1, n_folds + 1))
 
     completed: set[int] = set()
+    signature = experiment_signature(epochs=epochs, batch_size=batch_size)
     summary_path = RESULTS_DIR / "lopo_results_summary.csv"
     if summary_path.exists():
         try:
             df = pd.read_csv(summary_path)
-            if {"fold", "model_version"}.issubset(df.columns):
-                df = df[df["model_version"].astype(str) == MODEL_VERSION]
+            required = {
+                "fold",
+                "model_version",
+                "evaluation_version",
+                "results_schema_version",
+                "experiment_signature",
+            }
+            if required.issubset(df.columns):
+                df = df[
+                    (df["model_version"].astype(str) == MODEL_VERSION)
+                    & (df["evaluation_version"].astype(str) == EVALUATION_VERSION)
+                    & (df["results_schema_version"].astype(int) == RESULTS_SCHEMA_VERSION)
+                    & (df["experiment_signature"].astype(str) == signature)
+                ]
                 completed = {
                     int(value)
                     for value in df["fold"].dropna().tolist()
@@ -62,6 +81,7 @@ def remaining_folds() -> list[int]:
 
     remaining = sorted(all_folds.difference(completed))
     print(f"[*] Total LOPO folds: {n_folds}")
+    print(f"[*] Experiment signature: {signature}")
     print(f"[*] Completed folds: {sorted(completed)}")
     print(f"[*] Remaining folds: {remaining}")
     return remaining
@@ -84,7 +104,7 @@ def main() -> None:
 
     folds = args.folds
     if args.remaining:
-        folds = remaining_folds()
+        folds = remaining_folds(args.epochs, args.batch_size)
         if not folds:
             print("[+] All LOPO folds are complete.")
             return

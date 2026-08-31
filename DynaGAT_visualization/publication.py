@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import Sequence
 
@@ -15,7 +16,8 @@ from sklearn.metrics import (
     roc_curve,
 )
 
-from config import DEVELOPMENT_FOLD, WINDOW_STRIDE_SEC
+from config import DEVELOPMENT_FOLD, WINDOW_SEC, WINDOW_STRIDE_SEC
+from evaluation.metrics import compute_ece, window_decision_times
 
 
 DPI = 600
@@ -261,8 +263,9 @@ def plot_patient_events(primary: pd.DataFrame, out: Path) -> None:
     df = primary.iloc[order].reset_index(drop=True)
     x = np.arange(len(df))
     fig, axes = plt.subplots(2, 1, figsize=(12.0, 7.0), sharex=True)
-    axes[0].bar(x, df["gt_seizures"], label="Ground-truth seizures")
-    axes[0].bar(x, df["detected_seizures"], label="Detected seizures")
+    width = 0.42
+    axes[0].bar(x - width / 2, df["gt_seizures"], width=width, label="Ground-truth seizures")
+    axes[0].bar(x + width / 2, df["detected_seizures"], width=width, label="Detected seizures")
     axes[0].set_ylabel("Events")
     axes[0].legend()
     axes[1].bar(x, df["fa_per_hour"])
@@ -281,10 +284,7 @@ def plot_calibration(prediction_files: Sequence[Path], out: Path, n_bins: int = 
     labels = np.concatenate([np.asarray(_load_prediction(path)["labels"], dtype=float) for path in prediction_files])
     if probs.size == 0:
         return
-    edges = np.unique(np.quantile(probs, np.linspace(0.0, 1.0, n_bins + 1)))
-    if edges.size < 3:
-        edges = np.linspace(0.0, 1.0, n_bins + 1)
-    edges[0], edges[-1] = 0.0, 1.0
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
     centers, observed, weights = [], [], []
     for i in range(len(edges) - 1):
         low, high = edges[i], edges[i + 1]
@@ -294,7 +294,7 @@ def plot_calibration(prediction_files: Sequence[Path], out: Path, n_bins: int = 
         centers.append(float(np.mean(probs[mask])))
         observed.append(float(np.mean(labels[mask])))
         weights.append(float(np.mean(mask)))
-    ece = float(np.sum(np.asarray(weights) * np.abs(np.asarray(observed) - np.asarray(centers))))
+    ece = compute_ece(probs, labels, n_bins=n_bins)
     fig, ax = plt.subplots(figsize=(6.2, 5.4))
     ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.0, label="Perfect calibration")
     ax.plot(centers, observed, marker="o", linewidth=1.8, label=f"DynaGAT (ECE={ece:.3f})")
@@ -307,8 +307,7 @@ def plot_calibration(prediction_files: Sequence[Path], out: Path, n_bins: int = 
 
 
 def plot_detection_timeline(prediction_files: Sequence[Path], out: Path) -> None:
-    best = None
-    best_score = -np.inf
+    candidates = []
     for path in prediction_files:
         data = _load_prediction(path)
         probs = np.asarray(data["probs"], dtype=float)
@@ -326,30 +325,44 @@ def plot_detection_timeline(prediction_files: Sequence[Path], out: Path) -> None
             order = np.argsort(idx)
             idx, p = idx[order], p[order]
             for seizure_start, seizure_end in intervals:
-                onset_window = int(round(float(seizure_start) / WINDOW_STRIDE_SEC))
-                pos = int(np.searchsorted(idx, onset_window))
+                decision_times = window_decision_times(idx)
+                pos = int(np.searchsorted(decision_times, float(seizure_start)))
                 left, right = max(0, pos - 30), min(len(p), pos + 90)
                 if right <= left:
                     continue
                 score = float(np.nanmax(p[left:right]))
-                if score > best_score:
-                    best_score = score
-                    best = (rid, idx, p, threshold, float(seizure_start), float(seizure_end), pos)
-    if best is None:
+                candidates.append(
+                    (
+                        score,
+                        str(rid),
+                        idx,
+                        p,
+                        threshold,
+                        float(seizure_start),
+                        float(seizure_end),
+                        pos,
+                    )
+                )
+    if not candidates:
         return
-    rid, idx, probs, threshold, seizure_start, seizure_end, pos = best
+    # Select the median-response annotated seizure rather than cherry-picking
+    # the strongest detection as the "representative" example.
+    candidates.sort(key=lambda item: (item[0], item[1], item[5]))
+    _, rid, idx, probs, threshold, seizure_start, seizure_end, pos = candidates[
+        len(candidates) // 2
+    ]
     left, right = max(0, pos - 90), min(len(idx), pos + 150)
-    t = idx[left:right].astype(float) * WINDOW_STRIDE_SEC
+    t = window_decision_times(idx[left:right])
     p = probs[left:right]
     fig, ax = plt.subplots(figsize=(11.0, 4.2))
     ax.plot(t, p, linewidth=1.5, label="Seizure probability")
     ax.axhline(threshold, linestyle="--", linewidth=1.0, label=f"Validation threshold={threshold:.3f}")
     ax.axvspan(seizure_start, seizure_end, alpha=0.15, label="Annotated seizure")
     ax.axvline(seizure_start, linestyle="--", linewidth=1.0, label="Onset")
-    ax.set_xlabel("Recording time (s)")
+    ax.set_xlabel("Online decision time (s; window end)")
     ax.set_ylabel("Probability")
     ax.set_ylim(-0.02, 1.02)
-    ax.set_title(f"Representative primary held-out detection: {rid}")
+    ax.set_title(f"Median-response primary held-out seizure: {rid}")
     ax.grid(alpha=0.2)
     ax.legend(loc="upper left")
     _save(fig, out, "Figure9_detection_timeline")
@@ -372,18 +385,153 @@ def plot_operating_points(primary: pd.DataFrame, out: Path) -> None:
 
 
 def plot_metric_distributions(primary: pd.DataFrame, out: Path) -> None:
-    metrics = ["auroc", "auprc", "event_sensitivity", "event_f1", "fa_per_hour", "ece"]
-    available = [metric for metric in metrics if metric in primary.columns]
-    if not available:
+    performance = ["auroc", "auprc", "event_sensitivity", "event_f1", "ece"]
+    operational = ["fa_per_hour", "median_latency_sec"]
+    perf_available = [metric for metric in performance if metric in primary.columns]
+    op_available = [metric for metric in operational if metric in primary.columns]
+    if not perf_available and not op_available:
         return
-    data = [primary[metric].dropna().to_numpy(dtype=float) for metric in available]
-    fig, ax = plt.subplots(figsize=(10.0, 5.0))
-    ax.boxplot(data, tick_labels=available, showmeans=True)
-    ax.set_ylabel("Metric value")
-    ax.set_title("Distribution across primary held-out patients")
-    ax.tick_params(axis="x", rotation=30)
-    ax.grid(axis="y", alpha=0.2)
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 5.0))
+    if perf_available:
+        data = [primary[metric].dropna().to_numpy(dtype=float) for metric in perf_available]
+        axes[0].boxplot(data, tick_labels=perf_available, showmeans=True)
+        axes[0].set_ylim(-0.03, 1.03)
+        axes[0].set_ylabel("Metric value")
+        axes[0].set_title("Discrimination, detection, and calibration")
+    else:
+        axes[0].axis("off")
+    if op_available:
+        data = [primary[metric].dropna().to_numpy(dtype=float) for metric in op_available]
+        axes[1].boxplot(data, tick_labels=op_available, showmeans=True)
+        axes[1].set_ylabel("Native metric units")
+        axes[1].set_title("Operational outcomes")
+    else:
+        axes[1].axis("off")
+    for ax in axes:
+        ax.tick_params(axis="x", rotation=25)
+        ax.grid(axis="y", alpha=0.2)
     _save(fig, out, "FigureS2_metric_distributions")
+
+
+def plot_patient_metric_heatmap(primary: pd.DataFrame, out: Path) -> None:
+    """Annotated patient-by-metric view of bounded performance measures."""
+    columns = [
+        ("auroc", "AUROC"),
+        ("auprc", "AUPRC"),
+        ("f1", "Window F1"),
+        ("event_sensitivity", "Event sens."),
+        ("event_precision", "Event prec."),
+        ("event_f1", "Event F1"),
+    ]
+    columns = [(key, label) for key, label in columns if key in primary.columns]
+    if not columns:
+        return
+    df = primary.sort_values("fold").reset_index(drop=True)
+    values = df[[key for key, _ in columns]].to_numpy(dtype=float)
+    masked = np.ma.masked_invalid(values)
+    fig, ax = plt.subplots(figsize=(max(8.0, 1.25 * len(columns)), max(5.5, 0.36 * len(df) + 1.8)))
+    image = ax.imshow(masked, aspect="auto", vmin=0.0, vmax=1.0, cmap="viridis")
+    ax.set_xticks(np.arange(len(columns)), [label for _, label in columns], rotation=25, ha="right")
+    ax.set_yticks(np.arange(len(df)), df["test_patient"].astype(str).tolist())
+    for row in range(values.shape[0]):
+        for col in range(values.shape[1]):
+            value = values[row, col]
+            if np.isfinite(value):
+                color = "white" if value < 0.45 else "black"
+                ax.text(col, row, f"{value:.2f}", ha="center", va="center", fontsize=7, color=color)
+    fig.colorbar(image, ax=ax, label="Metric value")
+    ax.set_xlabel("Held-out performance metric")
+    ax.set_ylabel("Held-out patient")
+    ax.set_title("Primary patient-level performance heatmap")
+    _save(fig, out, "FigureS3_patient_metric_heatmap")
+
+
+def plot_window_confusion_heatmap(prediction_files: Sequence[Path], out: Path) -> None:
+    """Pooled confusion matrix using each fold's validation-selected threshold."""
+    counts = np.zeros((2, 2), dtype=np.int64)
+    for path in prediction_files:
+        data = _load_prediction(path)
+        labels = np.asarray(data["labels"], dtype=np.int64)
+        probs = np.asarray(data["probs"], dtype=float)
+        if labels.size == 0:
+            continue
+        threshold = float(np.asarray(data["threshold"]).item())
+        predicted = (probs >= threshold).astype(np.int64)
+        for truth in (0, 1):
+            for pred in (0, 1):
+                counts[truth, pred] += int(np.sum((labels == truth) & (predicted == pred)))
+    if counts.sum() == 0:
+        return
+    row_totals = counts.sum(axis=1, keepdims=True)
+    normalized = counts / np.maximum(row_totals, 1)
+    fig, ax = plt.subplots(figsize=(6.4, 5.4))
+    image = ax.imshow(normalized, vmin=0.0, vmax=1.0, cmap="Blues")
+    ax.set_xticks([0, 1], ["Non-seizure", "Seizure"])
+    ax.set_yticks([0, 1], ["Non-seizure", "Seizure"])
+    ax.set_xlabel("Predicted window class")
+    ax.set_ylabel("Ground-truth window class")
+    ax.set_title("Pooled primary window-level confusion matrix")
+    for truth in (0, 1):
+        for pred in (0, 1):
+            color = "white" if normalized[truth, pred] > 0.5 else "black"
+            ax.text(
+                pred,
+                truth,
+                f"{counts[truth, pred]:,}\n{normalized[truth, pred]:.1%}",
+                ha="center",
+                va="center",
+                color=color,
+            )
+    fig.colorbar(image, ax=ax, label="Within-class proportion")
+    _save(fig, out, "FigureS4_window_confusion_heatmap")
+
+
+def plot_validation_test_transfer_heatmap(primary: pd.DataFrame, out: Path) -> None:
+    required = {
+        "test_patient",
+        "val_event_sensitivity",
+        "event_sensitivity",
+        "val_fa_per_hour",
+        "fa_per_hour",
+    }
+    if not required.issubset(primary.columns):
+        return
+    df = primary.sort_values("fold").reset_index(drop=True)
+    sensitivity = df[["val_event_sensitivity", "event_sensitivity"]].to_numpy(dtype=float)
+    far = df[["val_fa_per_hour", "fa_per_hour"]].to_numpy(dtype=float)
+    fig, axes = plt.subplots(1, 2, figsize=(9.8, max(5.5, 0.36 * len(df) + 1.8)), sharey=True)
+    panels = [
+        (axes[0], sensitivity, "Event sensitivity", "viridis", 0.0, 1.0),
+        (axes[1], far, "False alarms per hour", "magma_r", 0.0, None),
+    ]
+    for ax, values, title, cmap, low, high in panels:
+        finite = values[np.isfinite(values)]
+        vmax = high if high is not None else (float(np.quantile(finite, 0.95)) if finite.size else 1.0)
+        vmax = max(vmax, 1e-6)
+        image = ax.imshow(np.ma.masked_invalid(values), aspect="auto", cmap=cmap, vmin=low, vmax=vmax)
+        ax.set_xticks([0, 1], ["Validation", "Held-out test"])
+        ax.set_title(title)
+        for row in range(values.shape[0]):
+            for col in range(values.shape[1]):
+                value = values[row, col]
+                if np.isfinite(value):
+                    rgba = image.cmap(image.norm(value))
+                    luminance = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
+                    color = "black" if luminance > 0.55 else "white"
+                    ax.text(
+                        col,
+                        row,
+                        f"{value:.2f}",
+                        ha="center",
+                        va="center",
+                        fontsize=7,
+                        color=color,
+                    )
+        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    axes[0].set_yticks(np.arange(len(df)), df["test_patient"].astype(str).tolist())
+    axes[0].set_ylabel("Held-out patient")
+    fig.suptitle("Validation-to-test operating-point transfer")
+    _save(fig, out, "FigureS5_validation_test_transfer_heatmap")
 
 
 def generate_publication_figures(
@@ -393,24 +541,36 @@ def generate_publication_figures(
     out_dir: Path,
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    for pattern in ("*.png", "*.pdf"):
-        for path in out_dir.glob(pattern):
-            path.unlink(missing_ok=True)
-
     primary = _primary_summary(summary_csv)
     predictions = _prediction_files(primary, results_dir)
     histories = _history_files(primary, results_dir)
 
-    plot_preprocessing(preprocessing_manifest, out_dir)
-    plot_architecture(out_dir)
-    plot_training(histories, out_dir)
-    plot_roc_pr(predictions, out_dir)
-    plot_event_tradeoff(primary, out_dir)
-    plot_sensitivity_forest(primary, out_dir)
-    plot_patient_events(primary, out_dir)
-    plot_calibration(predictions, out_dir)
-    plot_detection_timeline(predictions, out_dir)
-    plot_operating_points(primary, out_dir)
-    plot_metric_distributions(primary, out_dir)
+    # Generate into a staging directory so a failed export never destroys the
+    # last complete set of publication figures.
+    with tempfile.TemporaryDirectory(prefix="figure-staging-", dir=out_dir) as tmp:
+        staging = Path(tmp)
+        plot_preprocessing(preprocessing_manifest, staging)
+        plot_architecture(staging)
+        plot_training(histories, staging)
+        plot_roc_pr(predictions, staging)
+        plot_event_tradeoff(primary, staging)
+        plot_sensitivity_forest(primary, staging)
+        plot_patient_events(primary, staging)
+        plot_calibration(predictions, staging)
+        plot_detection_timeline(predictions, staging)
+        plot_operating_points(primary, staging)
+        plot_metric_distributions(primary, staging)
+        plot_patient_metric_heatmap(primary, staging)
+        plot_window_confusion_heatmap(predictions, staging)
+        plot_validation_test_transfer_heatmap(primary, staging)
+
+        generated = sorted(staging.glob("*.png")) + sorted(staging.glob("*.pdf"))
+        if not generated:
+            raise RuntimeError("Publication figure generation produced no files")
+        for pattern in ("*.png", "*.pdf"):
+            for path in out_dir.glob(pattern):
+                path.unlink(missing_ok=True)
+        for path in generated:
+            path.replace(out_dir / path.name)
 
     return sorted(out_dir.glob("*.pdf"))

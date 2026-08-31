@@ -91,6 +91,10 @@ FOCAL_GAMMA = 2.0
 EVENT_PERSISTENCE_CANDIDATES = (1, 2, 3)
 VALIDATION_FA_PER_HOUR_CAP = 0.5
 ALARM_REFRACTORY_SEC = 30.0
+# Probabilities are timestamped when their complete analysis window becomes
+# available. A strictly online detector therefore has no pre-onset tolerance.
+EVENT_EARLY_TOLERANCE_SEC = 0.0
+DECISION_TIME_REFERENCE = "window_end"
 EVENT_THRESHOLD_MAX_CANDIDATES = 81
 MIN_CONSECUTIVE_POSITIVE_WINDOWS = 3
 PREPROCESS_CHUNK_WINDOWS = 256

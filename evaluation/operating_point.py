@@ -39,18 +39,24 @@ def _threshold_candidates(
     # Dense coverage near the empirical high-probability tail plus a global grid.
     quantiles = np.quantile(finite, np.linspace(0.35, 0.9995, 61))
     linear = np.linspace(0.01, 0.99, 67)
+    no_alarm_threshold = np.nextafter(float(np.max(finite)), np.inf)
     candidates = np.unique(
-        np.clip(
-            np.concatenate([quantiles, linear, [fallback, 0.5]]),
-            1e-4,
-            1.0 - 1e-4,
+        np.concatenate(
+            [
+                np.clip(
+                    np.concatenate([quantiles, linear, [fallback, 0.5]]),
+                    1e-4,
+                    1.0 - 1e-4,
+                ),
+                [no_alarm_threshold],
+            ]
         )
     )
 
     if candidates.size > max_candidates:
         keep = np.linspace(0, candidates.size - 1, max_candidates, dtype=int)
         candidates = np.unique(
-            np.concatenate([candidates[keep], [fallback, 0.5]])
+            np.concatenate([candidates[keep], [fallback, 0.5, no_alarm_threshold]])
         )
     return candidates.astype(np.float64, copy=False)
 
@@ -114,7 +120,9 @@ def select_validation_operating_point(
     if frontier_path is not None:
         frontier_path = Path(frontier_path)
         frontier_path.parent.mkdir(parents=True, exist_ok=True)
-        frontier.to_csv(frontier_path, index=False)
+        temporary = frontier_path.with_suffix(frontier_path.suffix + ".tmp")
+        frontier.to_csv(temporary, index=False)
+        temporary.replace(frontier_path)
 
     # Degenerate validation set fallback: keep the window-F1 threshold and the
     # middle persistence candidate rather than using held-out information.

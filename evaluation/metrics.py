@@ -7,11 +7,22 @@ from sklearn.metrics import average_precision_score, f1_score, precision_recall_
 
 from config import (
     ALARM_REFRACTORY_SEC,
+    EVENT_EARLY_TOLERANCE_SEC,
     EVENT_THRESHOLD_MAX_CANDIDATES,
     MIN_CONSECUTIVE_POSITIVE_WINDOWS,
     WINDOW_SEC,
     WINDOW_STRIDE_SEC,
 )
+
+
+def window_decision_times(
+    window_indices: np.ndarray | Sequence[int],
+    stride_sec: float = WINDOW_STRIDE_SEC,
+    window_sec: float = WINDOW_SEC,
+) -> np.ndarray:
+    """Return the first online-available timestamp for each analysis window."""
+    indices = np.asarray(window_indices, dtype=np.float64)
+    return indices * float(stride_sec) + float(window_sec)
 
 
 def compute_window_metrics(labels: np.ndarray, probs: np.ndarray, threshold: float) -> Dict[str, float]:
@@ -155,11 +166,17 @@ def compute_event_metrics(
     threshold: float,
     min_consecutive_windows: int = MIN_CONSECUTIVE_POSITIVE_WINDOWS,
     refractory_sec: float = ALARM_REFRACTORY_SEC,
-    early_tolerance_sec: float = WINDOW_SEC,
+    early_tolerance_sec: float = EVENT_EARLY_TOLERANCE_SEC,
     stride_sec: float = WINDOW_STRIDE_SEC,
     window_sec: float = WINDOW_SEC,
 ) -> Dict[str, float]:
-    """Compute event sensitivity, event precision, FA/hour, and onset latency per EDF."""
+    """Compute online event metrics using window-end decision timestamps.
+
+    A probability for the window ``[start, start + window_sec]`` cannot be
+    emitted at ``start`` because the model consumes the complete window. Alarm
+    timestamps and latency therefore use ``start + window_sec``. The default
+    early tolerance is zero so a pre-onset decision cannot become a true alarm.
+    """
     probs = np.asarray(probs, dtype=np.float64)
     window_indices = np.asarray(window_indices, dtype=np.int64)
     recording_ids = np.asarray(recording_ids, dtype=object)
@@ -211,9 +228,9 @@ def compute_event_metrics(
                 first_window = int(seg_idx[start_local])
                 last_window = int(seg_idx[end_local])
                 alarm_window = int(seg_idx[alarm_local])
-                start_sec = first_window * stride_sec
-                end_sec = last_window * stride_sec + window_sec
-                alarm_sec = alarm_window * stride_sec
+                start_sec = float(window_decision_times([first_window], stride_sec, window_sec)[0])
+                end_sec = float(window_decision_times([last_window], stride_sec, window_sec)[0])
+                alarm_sec = float(window_decision_times([alarm_window], stride_sec, window_sec)[0])
                 pred_intervals.append((start_sec, end_sec, alarm_sec))
 
         matched_predictions = set()
@@ -222,8 +239,8 @@ def compute_event_metrics(
             for p_idx, (_pred_start, _pred_end, alarm_time) in enumerate(pred_intervals):
                 if p_idx in matched_predictions:
                     continue
-                # Permit only the small early offset caused by the analysis window.
-                # A long-running alarm from far before onset cannot become a TP.
+                # The default online protocol is strict (zero early tolerance).
+                # A non-zero tolerance must be an explicitly reported protocol choice.
                 if (
                     alarm_time >= seizure_start - early_tolerance_sec
                     and alarm_time <= seizure_end
@@ -308,18 +325,24 @@ def select_event_threshold(
 
     quantiles = np.quantile(finite, np.linspace(0.50, 0.999, 41))
     linear = np.linspace(0.02, 0.98, 49)
+    no_alarm_threshold = np.nextafter(float(np.max(finite)), np.inf)
     candidates = np.unique(
-        np.clip(
-            np.concatenate([quantiles, linear, [fallback, 0.5]]),
-            1e-4,
-            1.0 - 1e-4,
+        np.concatenate(
+            [
+                np.clip(
+                    np.concatenate([quantiles, linear, [fallback, 0.5]]),
+                    1e-4,
+                    1.0 - 1e-4,
+                ),
+                [no_alarm_threshold],
+            ]
         )
     )
 
     if candidates.size > max_candidates:
         keep = np.linspace(0, candidates.size - 1, max_candidates, dtype=int)
         candidates = np.unique(
-            np.concatenate([candidates[keep], [fallback, 0.5]])
+            np.concatenate([candidates[keep], [fallback, 0.5, no_alarm_threshold]])
         )
 
     best_threshold = float(fallback)

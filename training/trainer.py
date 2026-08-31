@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -12,6 +13,8 @@ import torch
 
 from config import (
     BATCH_SIZE,
+    CACHE_VERSION,
+    DECISION_TIME_REFERENCE,
     DEVELOPMENT_FOLD,
     DROPOUT,
     EARLY_STOPPING_PATIENCE,
@@ -31,6 +34,7 @@ from config import (
     VALIDATION_CHECK_INTERVAL,
     VALIDATION_FA_PER_HOUR_CAP,
     WEIGHT_DECAY,
+    WINDOW_SEC,
     WINDOW_STRIDE_SEC,
 )
 from dataset.sequence_dataset import TemporalClipDataset, compute_fold_normalization, load_temporal_cache
@@ -53,7 +57,55 @@ from training.runtime import (
 
 
 MODEL_VERSION = "causal_v5_residual_delta"
+EVALUATION_VERSION = "window_end_online_v1"
+RESULTS_SCHEMA_VERSION = 2
 ALARM_OBJECTIVE = "sensitivity_first_under_validation_far_cap"
+
+SIGNATURE_SOURCE_FILES = (
+    "config.py",
+    "dataset/sequence_dataset.py",
+    "evaluation/metrics.py",
+    "evaluation/operating_point.py",
+    "models/dynagat_model.py",
+    "training/losses.py",
+    "training/runtime.py",
+    "training/trainer.py",
+)
+
+
+def experiment_signature(epochs: int, batch_size: int) -> str:
+    """Fingerprint code, runtime settings, and the actual local cache set."""
+    root = Path(__file__).resolve().parent.parent
+    payload = {
+        "model_version": MODEL_VERSION,
+        "evaluation_version": EVALUATION_VERSION,
+        "results_schema_version": RESULTS_SCHEMA_VERSION,
+        "cache_version": CACHE_VERSION,
+        "preprocessing_tag": PREPROCESSING_TAG,
+        "epochs": int(epochs),
+        "batch_size": int(batch_size),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))
+    for relative in SIGNATURE_SOURCE_FILES:
+        path = root / relative
+        digest.update(relative.encode("utf-8"))
+        digest.update(path.read_bytes())
+    manifest_path = PROCESSED_DATA_DIR / "preprocessing_manifest.csv"
+    if manifest_path.exists():
+        digest.update(b"preprocessing_manifest.csv")
+        digest.update(manifest_path.read_bytes())
+    for cache_path in sorted(PROCESSED_DATA_DIR.glob("*_temporal_graphs.pt")):
+        size = cache_path.stat().st_size
+        digest.update(cache_path.name.encode("utf-8"))
+        digest.update(str(size).encode("ascii"))
+        # Sampling both ends catches accidental replacement without hashing many
+        # gigabytes of cache tensors before every resume/export check.
+        with cache_path.open("rb") as handle:
+            digest.update(handle.read(1024 * 1024))
+            if size > 1024 * 1024:
+                handle.seek(max(0, size - 1024 * 1024))
+                digest.update(handle.read(1024 * 1024))
+    return digest.hexdigest()[:20]
 
 
 def hardware_summary() -> Dict[str, object]:
@@ -71,8 +123,11 @@ def hardware_summary() -> Dict[str, object]:
         print(f"[*] Device: {props.name}")
         print(f"[*] CUDA runtime: {torch.version.cuda}")
         print(f"[*] GPU memory: {info['gpu_memory_gb']:.2f} GB")
-        torch.backends.cudnn.benchmark = True
-        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
     else:
         print("[!] CUDA not detected; training will use CPU.")
     return info
@@ -84,22 +139,53 @@ def save_predictions(
     threshold: float,
     persistence: int,
     test_subjects: List[str],
+    signature: str,
+    epochs: int,
+    batch_size: int,
 ) -> None:
     metadata_json = json.dumps(bundle.recording_metadata, separators=(",", ":"))
-    np.savez_compressed(
-        path,
-        probs=bundle.probs.astype(np.float32, copy=False),
-        labels=bundle.labels.astype(np.uint8, copy=False),
-        recording_ids=np.asarray(bundle.recording_ids, dtype=str),
-        window_indices=bundle.window_indices.astype(np.int64, copy=False),
-        threshold=np.asarray(float(threshold), dtype=np.float32),
-        min_consecutive_windows=np.asarray(int(persistence), dtype=np.int16),
-        validation_far_cap=np.asarray(float(VALIDATION_FA_PER_HOUR_CAP), dtype=np.float32),
-        test_patient=np.asarray("+".join(test_subjects), dtype=str),
-        model_version=np.asarray(MODEL_VERSION, dtype=str),
-        window_stride_sec=np.asarray(float(WINDOW_STRIDE_SEC), dtype=np.float32),
-        recording_metadata_json=np.asarray(metadata_json, dtype=str),
-    )
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            probs=bundle.probs.astype(np.float32, copy=False),
+            labels=bundle.labels.astype(np.uint8, copy=False),
+            recording_ids=np.asarray(bundle.recording_ids, dtype=str),
+            window_indices=bundle.window_indices.astype(np.int64, copy=False),
+            threshold=np.asarray(float(threshold), dtype=np.float64),
+            min_consecutive_windows=np.asarray(int(persistence), dtype=np.int16),
+            validation_far_cap=np.asarray(
+                float(VALIDATION_FA_PER_HOUR_CAP), dtype=np.float32
+            ),
+            test_patient=np.asarray("+".join(test_subjects), dtype=str),
+            model_version=np.asarray(MODEL_VERSION, dtype=str),
+            evaluation_version=np.asarray(EVALUATION_VERSION, dtype=str),
+            results_schema_version=np.asarray(
+                RESULTS_SCHEMA_VERSION, dtype=np.int16
+            ),
+            experiment_signature=np.asarray(signature, dtype=str),
+            max_epochs=np.asarray(int(epochs), dtype=np.int16),
+            batch_size=np.asarray(int(batch_size), dtype=np.int16),
+            window_stride_sec=np.asarray(
+                float(WINDOW_STRIDE_SEC), dtype=np.float32
+            ),
+            window_sec=np.asarray(float(WINDOW_SEC), dtype=np.float32),
+            decision_time_reference=np.asarray(DECISION_TIME_REFERENCE, dtype=str),
+            recording_metadata_json=np.asarray(metadata_json, dtype=str),
+        )
+    temporary.replace(path)
+
+
+def atomic_torch_save(payload: Dict, path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def atomic_dataframe_csv(df: pd.DataFrame, path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(temporary, index=False)
+    temporary.replace(path)
 
 
 def selected_fold_indices(
@@ -120,7 +206,7 @@ def selected_fold_indices(
     return list(range(n_groups))
 
 
-def load_existing_results(summary_path: Path) -> Dict[int, Dict]:
+def load_existing_results(summary_path: Path, expected_signature: str) -> Dict[int, Dict]:
     if not summary_path.exists():
         return {}
     try:
@@ -128,9 +214,25 @@ def load_existing_results(summary_path: Path) -> Dict[int, Dict]:
     except Exception as exc:
         print(f"[warn] Could not read existing summary: {exc}")
         return {}
-    if "fold" not in df.columns or "model_version" not in df.columns:
+    required = {
+        "fold",
+        "model_version",
+        "evaluation_version",
+        "results_schema_version",
+        "cache_version",
+        "preprocessing_tag",
+        "experiment_signature",
+    }
+    if not required.issubset(df.columns):
         return {}
-    df = df[df["model_version"].astype(str) == MODEL_VERSION]
+    df = df[
+        (df["model_version"].astype(str) == MODEL_VERSION)
+        & (df["evaluation_version"].astype(str) == EVALUATION_VERSION)
+        & (df["results_schema_version"].astype(int) == RESULTS_SCHEMA_VERSION)
+        & (df["cache_version"].astype(int) == CACHE_VERSION)
+        & (df["preprocessing_tag"].astype(str) == PREPROCESSING_TAG)
+        & (df["experiment_signature"].astype(str) == expected_signature)
+    ]
     rows: Dict[int, Dict] = {}
     for row in df.to_dict(orient="records"):
         try:
@@ -144,7 +246,7 @@ def write_results(summary_path: Path, rows_by_fold: Dict[int, Dict]) -> pd.DataF
     if not rows_by_fold:
         return pd.DataFrame()
     df = pd.DataFrame([rows_by_fold[key] for key in sorted(rows_by_fold)])
-    df.to_csv(summary_path, index=False)
+    atomic_dataframe_csv(df, summary_path)
     return df
 
 
@@ -156,6 +258,7 @@ def run_lopo(
 ) -> None:
     seed_everything(RANDOM_SEED)
     hw = hardware_summary()
+    signature = experiment_signature(epochs=epochs, batch_size=batch_size)
 
     cache_paths = sorted(PROCESSED_DATA_DIR.glob("*_temporal_graphs.pt"))
     if not cache_paths:
@@ -174,12 +277,13 @@ def run_lopo(
     validation_size = min(4, len(groups) - 2)
     fold_indices = selected_fold_indices(len(groups), max_folds, folds)
     summary_path = RESULTS_DIR / "lopo_results_summary.csv"
-    results_by_fold = load_existing_results(summary_path)
+    results_by_fold = load_existing_results(summary_path, signature)
 
     print(f"[*] Independent patient groups: {len(groups)}")
     print(f"[*] Selected folds: {[idx + 1 for idx in fold_indices]}")
     print(f"[*] Validation groups per fold: {validation_size}")
     print(f"[*] Validation FA/h cap: {VALIDATION_FA_PER_HOUR_CAP:.3f}")
+    print(f"[*] Experiment signature: {signature}")
     print(f"[*] Existing completed folds: {sorted(results_by_fold)}")
 
     for fold_idx in fold_indices:
@@ -321,8 +425,9 @@ def run_lopo(
         model.load_state_dict(best_state)
         del best_state
 
-        pd.DataFrame(history).to_csv(
-            RESULTS_DIR / f"fold_{fold_number:02d}_training_history.csv", index=False
+        atomic_dataframe_csv(
+            pd.DataFrame(history),
+            RESULTS_DIR / f"fold_{fold_number:02d}_training_history.csv",
         )
 
         val_pred = predict(model, val_loader)
@@ -378,10 +483,17 @@ def run_lopo(
         )
 
         checkpoint_path = RESULTS_DIR / f"dynagat_fold_{fold_number:02d}_{fold_name}.pt"
-        torch.save(
+        atomic_torch_save(
             {
                 "model_version": MODEL_VERSION,
+                "evaluation_version": EVALUATION_VERSION,
+                "results_schema_version": RESULTS_SCHEMA_VERSION,
+                "cache_version": CACHE_VERSION,
                 "preprocessing_tag": PREPROCESSING_TAG,
+                "experiment_signature": signature,
+                "max_epochs": int(epochs),
+                "batch_size": int(batch_size),
+                "decision_time_reference": DECISION_TIME_REFERENCE,
                 "model_state_dict": model.state_dict(),
                 "test_subjects": test_subjects,
                 "validation_subjects": val_subjects,
@@ -404,13 +516,23 @@ def run_lopo(
             threshold,
             persistence,
             test_subjects,
+            signature,
+            epochs,
+            batch_size,
         )
 
         result_row = {
             "fold": fold_number,
             "evaluation_role": "development" if fold_number == DEVELOPMENT_FOLD else "primary",
             "model_version": MODEL_VERSION,
+            "evaluation_version": EVALUATION_VERSION,
+            "results_schema_version": RESULTS_SCHEMA_VERSION,
+            "cache_version": CACHE_VERSION,
             "preprocessing_tag": PREPROCESSING_TAG,
+            "experiment_signature": signature,
+            "max_epochs": int(epochs),
+            "batch_size": int(batch_size),
+            "decision_time_reference": DECISION_TIME_REFERENCE,
             "alarm_objective": ALARM_OBJECTIVE,
             "test_patient": fold_name,
             "validation_patient": "+".join(val_subjects),

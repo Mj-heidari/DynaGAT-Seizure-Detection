@@ -25,10 +25,12 @@ from config import (
     BOOTSTRAP_REPLICATES,
     BOOTSTRAP_SEED,
     CACHE_VERSION,
+    DECISION_TIME_REFERENCE,
     DEVELOPMENT_FOLD,
     DROPOUT,
     EPOCHS,
     EVENT_PERSISTENCE_CANDIDATES,
+    EVENT_EARLY_TOLERANCE_SEC,
     FOCAL_ALPHA,
     FOCAL_GAMMA,
     GAT_HEADS,
@@ -75,6 +77,29 @@ def _bootstrap_mean_ci(values: Iterable[float]) -> tuple[float, float]:
     samples = rng.choice(x, size=(BOOTSTRAP_REPLICATES, x.size), replace=True)
     means = samples.mean(axis=1)
     return float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))
+
+
+def _cluster_bootstrap_rate_ci(
+    df: pd.DataFrame,
+    numerator: str,
+    denominator: str,
+) -> tuple[float, float]:
+    """Patient-cluster bootstrap CI for a pooled count/exposure rate."""
+    num = df[numerator].to_numpy(dtype=float)
+    den = df[denominator].to_numpy(dtype=float)
+    valid = np.isfinite(num) & np.isfinite(den) & (den > 0)
+    num, den = num[valid], den[valid]
+    if num.size == 0:
+        return float("nan"), float("nan")
+    if num.size == 1:
+        rate = float(num[0] / den[0])
+        return rate, rate
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    indices = rng.integers(0, num.size, size=(BOOTSTRAP_REPLICATES, num.size))
+    sampled_num = num[indices].sum(axis=1)
+    sampled_den = den[indices].sum(axis=1)
+    rates = sampled_num / np.maximum(sampled_den, 1e-12)
+    return float(np.quantile(rates, 0.025)), float(np.quantile(rates, 0.975))
 
 
 def _wilson_interval(successes: int, total: int, z: float = 1.959963984540054) -> tuple[float, float]:
@@ -129,11 +154,14 @@ def _environment_snapshot() -> dict:
         snapshot["gpu"] = props.name
         snapshot["gpu_memory_gb"] = round(props.total_memory / (1024 ** 3), 3)
         snapshot["cuda_capability"] = list(torch.cuda.get_device_capability(0))
+        snapshot["cudnn_deterministic"] = bool(torch.backends.cudnn.deterministic)
+        snapshot["cudnn_benchmark"] = bool(torch.backends.cudnn.benchmark)
+        snapshot["cuda_matmul_allow_tf32"] = bool(torch.backends.cuda.matmul.allow_tf32)
     return snapshot
 
 
-def _configuration_snapshot() -> dict:
-    return {
+def _configuration_snapshot(runtime_overrides: dict | None = None) -> dict:
+    snapshot = {
         "cache_version": CACHE_VERSION,
         "preprocessing_tag": PREPROCESSING_TAG,
         "sampling_rate_hz": SFREQ,
@@ -157,9 +185,14 @@ def _configuration_snapshot() -> dict:
         "validation_fa_per_hour_cap": VALIDATION_FA_PER_HOUR_CAP,
         "persistence_candidates": list(EVENT_PERSISTENCE_CANDIDATES),
         "alarm_refractory_sec": ALARM_REFRACTORY_SEC,
+        "event_early_tolerance_sec": EVENT_EARLY_TOLERANCE_SEC,
+        "decision_time_reference": DECISION_TIME_REFERENCE,
         "random_seed": RANDOM_SEED,
         "development_fold": DEVELOPMENT_FOLD,
     }
+    if runtime_overrides:
+        snapshot.update(runtime_overrides)
+    return snapshot
 
 
 def generate_paper_statistics(
@@ -185,6 +218,23 @@ def generate_paper_statistics(
     primary = df[df["evaluation_role"] == "primary"].copy()
     if primary.empty:
         raise RuntimeError("No primary held-out folds are available")
+
+    runtime_overrides = {}
+    for column, output_name, cast in (
+        ("max_epochs", "max_epochs", int),
+        ("batch_size", "batch_size", int),
+        ("model_version", "model_version", str),
+        ("evaluation_version", "evaluation_version", str),
+        ("experiment_signature", "experiment_signature", str),
+    ):
+        if column not in primary.columns:
+            continue
+        values = primary[column].dropna().unique().tolist()
+        if len(values) != 1:
+            raise RuntimeError(
+                f"Primary folds contain inconsistent {column} values: {values}"
+            )
+        runtime_overrides[output_name] = cast(values[0])
 
     all_path = paper_results_dir / "all_per_patient_results.csv"
     primary_path = paper_results_dir / "primary_per_patient_results.csv"
@@ -232,6 +282,12 @@ def generate_paper_statistics(
     pooled_far = false_alarms / interictal_hours if interictal_hours > 0 else float("nan")
     sens_low, sens_high = _wilson_interval(detected, total_gt)
     far_low, far_high = _poisson_rate_interval(false_alarms, interictal_hours)
+    cluster_sens_low, cluster_sens_high = _cluster_bootstrap_rate_ci(
+        primary, "detected_seizures", "gt_seizures"
+    )
+    cluster_far_low, cluster_far_high = _cluster_bootstrap_rate_ci(
+        primary, "false_alarms", "interictal_hours"
+    )
 
     pooled = pd.DataFrame(
         [
@@ -240,16 +296,20 @@ def generate_paper_statistics(
                 "detected_seizures": detected,
                 "total_seizures": total_gt,
                 "micro_event_sensitivity": sensitivity,
-                "micro_event_sensitivity_ci95_low": sens_low,
-                "micro_event_sensitivity_ci95_high": sens_high,
+                "micro_event_sensitivity_ci95_low": cluster_sens_low,
+                "micro_event_sensitivity_ci95_high": cluster_sens_high,
+                "conditional_wilson_sensitivity_ci95_low": sens_low,
+                "conditional_wilson_sensitivity_ci95_high": sens_high,
                 "micro_event_precision": precision,
                 "micro_event_f1": event_f1,
                 "false_alarms": false_alarms,
                 "interictal_hours": interictal_hours,
                 "recording_hours": recording_hours,
                 "pooled_fa_per_hour": pooled_far,
-                "pooled_fa_per_hour_ci95_low": far_low,
-                "pooled_fa_per_hour_ci95_high": far_high,
+                "pooled_fa_per_hour_ci95_low": cluster_far_low,
+                "pooled_fa_per_hour_ci95_high": cluster_far_high,
+                "conditional_poisson_fa_per_hour_ci95_low": far_low,
+                "conditional_poisson_fa_per_hour_ci95_high": far_high,
             }
         ]
     )
@@ -300,7 +360,7 @@ def generate_paper_statistics(
         table1.to_csv(tables_dir / "Table1_dataset_summary.csv", index=False)
         _write_latex(table1, tables_dir / "Table1_dataset_summary.tex")
 
-    config_snapshot = _configuration_snapshot()
+    config_snapshot = _configuration_snapshot(runtime_overrides)
     environment_snapshot = _environment_snapshot()
     (paper_results_dir / "experiment_config.json").write_text(
         json.dumps(config_snapshot, indent=2), encoding="utf-8"
@@ -331,10 +391,13 @@ def generate_paper_statistics(
         f"Macro event sensitivity: {metric_text('event_sensitivity')}\n\n"
         f"Macro FA/h: {metric_text('fa_per_hour')}\n\n"
         f"Macro median-latency statistic: {metric_text('median_latency_sec')} s\n\n"
-        f"Micro event sensitivity: {sensitivity:.3f} [{sens_low:.3f}, {sens_high:.3f}] "
+        f"Micro event sensitivity: {sensitivity:.3f} "
+        f"[{cluster_sens_low:.3f}, {cluster_sens_high:.3f}] "
         f"({detected}/{total_gt} seizures).\n\n"
-        f"Pooled false-alarm rate: {pooled_far:.3f} [{far_low:.3f}, {far_high:.3f}] FA/h "
+        f"Pooled false-alarm rate: {pooled_far:.3f} "
+        f"[{cluster_far_low:.3f}, {cluster_far_high:.3f}] FA/h "
         f"over {interictal_hours:.1f} interictal hours.\n"
+        "Pooled 95% intervals use patient-cluster bootstrap resampling.\n"
     )
     narrative_path = paper_results_dir / "results_summary.md"
     narrative_path.write_text(narrative, encoding="utf-8")
