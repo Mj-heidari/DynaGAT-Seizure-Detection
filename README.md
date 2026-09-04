@@ -62,7 +62,7 @@ neighbourhoods, which is both lighter on VRAM and faster for an 18-node graph.
 ## Run
 
 ```powershell
-$env:CHBMIT_BIDS_ROOT="D:\EEG_Dataset\CHB_MIT\BIDS_CHB-MIT\BIDS_CHB-MIT"
+$env:CHBMIT_BIDS_ROOT="BIDS_CHB-MIT"
 
 python -u run_selftest.py            # 1. correctness, no dataset needed (~3 min)
 python -u run_healthcheck.py         # 2. environment + measured speed projection
@@ -74,7 +74,7 @@ python -u make_paper_figures.py      # 6. figures + tables for the paper
 ```
 
 Or run everything with `.\run_all.ps1`. VS Code launch configurations for each step are in
-`.vscode/launch.json` (select `GNN_pytorch_gpu` as the interpreter, then pick a
+`.vscode/launch.json` (select `env` as the interpreter, then pick a
 configuration from the Run and Debug panel).
 
 Start with a two-subject smoke test before committing to the full preprocessing pass:
@@ -176,18 +176,4 @@ paper_tables/       dataset / main-comparison / patient-level tables as CSV and 
 paper_figures/      vector PDF + 600 dpi PNG
 ```
 
-## Protocol notes for the manuscript
 
-* Fold 1 is the development fold and is excluded from the primary statistics; it is still
-  exported so the split is auditable.
-* Alarms are timestamped at the window end. The primary protocol allows **no** pre-onset
-  tolerance; a 10 s-tolerance column is exported as `tol10_*` for comparability with papers
-  that use one.
-* An alarm inside `[onset, offset + 30 s]` detects that seizure; the first such alarm counts,
-  later ones are neither true nor false. Alarms outside every seizure interval are false alarms.
-* FA/h is computed over interictal hours, excluding the seizure intervals and their tolerance.
-* The first 60 windows of every recording emit a neutral relative-feature value while the
-  causal baseline converges; the online detector score is likewise held neutral for its first
-  120 windows. Both are protocol details worth one sentence in the manuscript.
-* `chb01` and `chb21` are the same subject; the BIDS conversion already merges them into
-  `sub-01`, so no fold splits them.
