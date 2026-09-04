@@ -1,0 +1,24 @@
+# Build / cache
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Editor
+.vscode/
+.idea/
+
+# Data caches (rebuild with `python -m dataset.preprocess`)
+data_cache_v4/
+data_cache*/
+
+# Run outputs (regenerate with run_lopo.py / make_paper_figures.py)
+results/
+paper_figures/
+paper_tables/
+paper_results/
+
+# Large artefacts
+*.pt
+*.npz
+*.edf

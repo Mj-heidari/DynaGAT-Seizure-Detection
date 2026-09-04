@@ -1,0 +1,13 @@
+# DynaGAT runtime requirements.
+# torch is intentionally NOT pinned here: install the CUDA build that matches
+# your driver first, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+# The pipeline needs no torch-geometric: graph attention is implemented with
+# gathered fixed-degree neighbourhoods in models/dynagat.py.
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+mne>=1.5
+tqdm>=4.65
+matplotlib>=3.7
+scikit-learn>=1.3
