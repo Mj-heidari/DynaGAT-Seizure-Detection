@@ -1,21 +1,8 @@
-"""
-DynaGAT configuration.
+"""Paths and scientific configuration for DynaGAT.
 
-the current pipeline rebuild rationale (see docs/DESIGN_NOTES.md):
-  * an earlier iteration used a broadband (0.5-45 Hz) wPLI on 2 s windows as its "dynamic view".
-    Broadband analytic-signal phase is not physically interpretable, so that
-    view carried little signal and the dual-view claim was unsupported.
-  * an earlier iteration trained on a 6:1 negative-subsampled distribution but evaluated on the
-    full ~1:400 distribution, which destroyed probability calibration
-    (val AUPRC 0.44 -> test AUPRC 0.048) and made the validation-selected
-    operating point untransferable.
-  * an earlier iteration normalised features with training-patient statistics only, so held-out
-    patients were evaluated under a shifted input distribution.
-
-the current pipeline replaces the functional view with a *directed* Granger-causal graph,
-adds causal trailing-baseline (patient-adaptive) features, corrects the
-training/deployment prior shift explicitly, and normalises detector output
-online per recording.
+Set local data paths through environment variables. Method development history
+is documented in docs/design_notes.md. Preserve the configuration and exact
+source revision with each reported experiment.
 """
 from __future__ import annotations
 
@@ -28,7 +15,7 @@ import torch
 # Paths
 # --------------------------------------------------------------------------- #
 PROJECT_ROOT = Path(__file__).resolve().parent
-_DEFAULT_BIDS_ROOT = r"D:\EEG_Dataset\CHB_MIT\BIDS_CHB-MIT\BIDS_CHB-MIT"
+_DEFAULT_BIDS_ROOT = PROJECT_ROOT / "data" / "BIDS_CHB-MIT"
 BIDS_ROOT = Path(os.environ.get("CHBMIT_BIDS_ROOT", _DEFAULT_BIDS_ROOT))
 
 CACHE_VERSION = 4
@@ -175,7 +162,7 @@ ONSET_AUX_WEIGHT = 0.2
 RANDOM_SEED = 42
 
 # --------------------------------------------------------------------------- #
-# Online detector post-processing (the an earlier iteration -> the current pipeline transfer fix)
+# Online detector post-processing
 # --------------------------------------------------------------------------- #
 # Detector output is converted to a causal, recording-adaptive score before
 # thresholding. This removes the per-patient probability offset that made an earlier iteration's

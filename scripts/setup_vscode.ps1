@@ -1,9 +1,9 @@
-# One-shot VS Code setup for DynaGAT-V2.
+# One-shot VS Code setup for DynaGAT.
 # Writes .vscode/launch.json and .vscode/settings.json for this workspace.
 # .vscode is git-ignored, so run this once after cloning:
-#     powershell -ExecutionPolicy Bypass -File .\setup_vscode.ps1
+#     powershell -ExecutionPolicy Bypass -File .\scripts\setup_vscode.ps1
 $ErrorActionPreference = "Stop"
-Set-Location -Path $PSScriptRoot
+Set-Location -Path (Split-Path -Parent $PSScriptRoot)
 New-Item -ItemType Directory -Force -Path ".vscode" | Out-Null
 
 $launch = @'
@@ -20,20 +20,20 @@ $launch = @'
       "name": "1 - health check",
       "type": "debugpy", "request": "launch", "program": "${workspaceFolder}/run_healthcheck.py",
       "console": "integratedTerminal", "cwd": "${workspaceFolder}",
-      "env": {"PYTHONUNBUFFERED": "1", "CHBMIT_BIDS_ROOT": "D:\\EEG_Dataset\\CHB_MIT\\BIDS_CHB-MIT\\BIDS_CHB-MIT"}
+      "env": {"PYTHONUNBUFFERED": "1", "CHBMIT_BIDS_ROOT": "${env:CHBMIT_BIDS_ROOT}"}
     },
     {
       "name": "2 - preprocess cache",
       "type": "debugpy", "request": "launch", "module": "dataset.preprocess",
       "console": "integratedTerminal", "cwd": "${workspaceFolder}",
-      "env": {"PYTHONUNBUFFERED": "1", "CHBMIT_BIDS_ROOT": "D:\\EEG_Dataset\\CHB_MIT\\BIDS_CHB-MIT\\BIDS_CHB-MIT"}
+      "env": {"PYTHONUNBUFFERED": "1", "CHBMIT_BIDS_ROOT": "${env:CHBMIT_BIDS_ROOT}"}
     },
     {
       "name": "2b - preprocess 2 subjects (smoke)",
       "type": "debugpy", "request": "launch", "module": "dataset.preprocess",
       "args": ["--max-subjects", "2"],
       "console": "integratedTerminal", "cwd": "${workspaceFolder}",
-      "env": {"PYTHONUNBUFFERED": "1", "CHBMIT_BIDS_ROOT": "D:\\EEG_Dataset\\CHB_MIT\\BIDS_CHB-MIT\\BIDS_CHB-MIT"}
+      "env": {"PYTHONUNBUFFERED": "1", "CHBMIT_BIDS_ROOT": "${env:CHBMIT_BIDS_ROOT}"}
     },
     {
       "name": "3 - LOPO (full)",
@@ -49,7 +49,7 @@ $launch = @'
       "env": {"PYTHONUNBUFFERED": "1"}
     },
     {
-      "name": "4 - baselines + ablations",
+      "name": "4 - model ablations",
       "type": "debugpy", "request": "launch", "program": "${workspaceFolder}/run_lopo.py",
       "args": ["--all-ablations"],
       "console": "integratedTerminal", "cwd": "${workspaceFolder}",
@@ -70,8 +70,7 @@ $settings = @'
   "python.terminal.activateEnvironment": true,
   "python.analysis.extraPaths": ["${workspaceFolder}"],
   "terminal.integrated.env.windows": {
-    "PYTHONPATH": "${workspaceFolder}",
-    "CHBMIT_BIDS_ROOT": "D:\\EEG_Dataset\\CHB_MIT\\BIDS_CHB-MIT\\BIDS_CHB-MIT"
+    "PYTHONPATH": "${workspaceFolder}"
   }
 }
 '@
@@ -79,4 +78,4 @@ $settings = @'
 Set-Content -Path ".vscode\launch.json"   -Value $launch   -Encoding UTF8
 Set-Content -Path ".vscode\settings.json" -Value $settings -Encoding UTF8
 Write-Host "Wrote .vscode\launch.json and .vscode\settings.json" -ForegroundColor Green
-Write-Host "In VS Code: Ctrl+Shift+P -> Python: Select Interpreter -> GNN_pytorch_gpu" -ForegroundColor Yellow
+Write-Host "In VS Code: Ctrl+Shift+P -> Python: Select Interpreter -> your DynaGAT environment" -ForegroundColor Yellow
